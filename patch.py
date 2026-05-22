@@ -45,6 +45,11 @@ def run_cmd(cmd, capture=False):
     if capture:
         kw["capture_output"] = True
         kw["text"] = True
+    if IS_WINDOWS:
+        # On Windows, use shell=True so .cmd wrappers (npx.cmd, etc.) are found.
+        # subprocess.list2cmdline properly quotes arguments with spaces.
+        cmd = subprocess.list2cmdline(cmd)
+        kw["shell"] = True
     result = subprocess.run(cmd, **kw)
     stdout = result.stdout.strip() if capture and result.stdout else ""
     return result.returncode, stdout
