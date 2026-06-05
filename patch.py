@@ -208,6 +208,8 @@ def _find(base, pattern):
 
 def apply_patch(fp, name, find_str, replace_str, regex=None, replace_fn=None,
                 skip_marker=None):
+    if not find_str and not skip_marker:
+        raise ValueError(f"patch '{name}': skip_marker required when find_str is None")
     with open(fp, encoding="utf-8") as f:
         content = f.read()
     bn = os.path.basename(fp)
@@ -279,7 +281,7 @@ def step_patch_js(assets):
         for fp in files:
             apply_patch(fp, "isServiceTierAllowed 门控",
                 None, None,
-                r'([a-zA-Z_$]+)=([a-zA-Z_$]+)\?\.authMethod===`chatgpt`(?=,)',
+                r'([a-zA-Z_$]+)=([a-zA-Z_$]+)\?\.authMethod===`chatgpt`(?=[,;])',
                 lambda m: f"{m.group(1)}=(!0/*svc-tier-patched*/||{m.group(2)}?.authMethod===`chatgpt`)",
                 skip_marker="/*svc-tier-patched*/")
     else:
@@ -303,14 +305,20 @@ def step_patch_js(assets):
         _report_missing("请求级 fast_mode 解锁",
                         "read-service-tier-for-request-*.js / fast_mode")
 
-    # ── 模块 2: i18n 多语言 ──────────────────────────────────────
-    print("\n  [模块 2] i18n 多语言")
+    # ── 模块 2: 插件侧边栏 + i18n ──────────────────────────────
+    print("\n  [模块 2] 插件侧边栏 + i18n")
     # 老版本 (useMemo) + 新版本 (React Forget cache) 都可能出现
     files = _find(assets, "app-main-*.js")
     if not files:
         files = _find_by_content(assets, "enable_i18n", "sidebarElectron")
     if files:
         for fp in files:
+            apply_patch(fp, "插件侧边栏解锁",
+                "d?(0,$.jsx)(rf,{tooltipContent:(0,$.jsx)(Y,{id:`sidebarElectron.pluginsDisabledTooltip`",
+                "0?(0,$.jsx)(rf,{tooltipContent:(0,$.jsx)(Y,{id:`sidebarElectron.pluginsDisabledTooltip`",
+                r'([a-zA-Z_$])\?\(0,\$\.jsx\)\([a-zA-Z_$]+,\{tooltipContent:\(0,\$\.jsx\)\([a-zA-Z_$]+,\{id:`sidebarElectron\.pluginsDisabledTooltip`',
+                lambda m: m.group(0).replace(m.group(1) + "?", "0?", 1),
+                skip_marker="0?(0,$.jsx)")
             # 新版: a?.get(`enable_i18n`,!1)  →  !0 (并保留原表达式作为死代码 + sentinel 以便重入识别)
             apply_patch(fp, "i18n 强制启用 (新版)",
                 None, None,
@@ -324,7 +332,7 @@ def step_patch_js(assets):
                 r'([a-zA-Z_$])=\(0,[a-zA-Z_$]+\.useMemo\)\(\(\)=>[a-zA-Z_$]+\?\.get\(`enable_i18n`,!1\),\[[a-zA-Z_$]+\]\)',
                 lambda m: f"{m.group(1)}=(0,Q.useMemo)(()=>!0,[n])")
     else:
-        _report_missing("i18n 强制启用", "app-main-*.js / enable_i18n")
+        _report_missing("插件侧边栏 + i18n", "app-main-*.js / enable_i18n")
 
     # ── 模块 3: 插件连接器 (1 补丁) ──────────────────────────────
     print("\n  [模块 3] 插件连接器")
@@ -391,8 +399,9 @@ def step_patch_js(assets):
             apply_patch(fp, "语音输入解锁",
                 "n&&t.authMethod===`chatgpt`",
                 "n&&(t.authMethod===`chatgpt`||t.authMethod===`apikey`)",
-                r'([a-zA-Z_$]+)&&([a-zA-Z_$]+)\.authMethod===`chatgpt`(?!\|\|)',
-                lambda m: f"{m.group(1)}&&({m.group(2)}.authMethod===`chatgpt`||{m.group(2)}.authMethod===`apikey`)")
+                r'([a-zA-Z_$]+)&&([a-zA-Z_$]+)\.authMethod===`chatgpt`',
+                lambda m: f"{m.group(1)}&&({m.group(2)}.authMethod===`chatgpt`||{m.group(2)}.authMethod===`apikey`)",
+                skip_marker="authMethod===`apikey`")
     else:
         _report_missing("语音输入解锁",
                         "use-is-dictation-supported-*.js / authMethod===chatgpt + dictation")
@@ -409,7 +418,7 @@ def step_patch_js(assets):
             apply_patch(fp, "用量设置解锁 (作用域外层 h)",
                 "h=l===`chatgpt`",
                 "h=l===`chatgpt`||l===`apikey`",
-                r'([a-zA-Z_$]+)=([a-zA-Z_$]+)===`chatgpt`(?=,)',
+                r'([a-zA-Z_$]+)=([a-zA-Z_$]+)===`chatgpt`(?=[,;])',
                 lambda m: f"{m.group(1)}={m.group(2)}===`chatgpt`||{m.group(2)}===`apikey`")
             apply_patch(fp, "用量设置解锁 (作用域内层 i)",
                 "let i=e===`chatgpt`",
