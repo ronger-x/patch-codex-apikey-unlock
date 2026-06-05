@@ -206,12 +206,14 @@ def _find(base, pattern):
     return glob.glob(os.path.join(base, pattern))
 
 
-def apply_patch(fp, name, find_str, replace_str, regex=None, replace_fn=None):
+def apply_patch(fp, name, find_str, replace_str, regex=None, replace_fn=None,
+                skip_marker=None):
     with open(fp, encoding="utf-8") as f:
         content = f.read()
     bn = os.path.basename(fp)
 
-    if replace_str and replace_str in content:
+    marker = skip_marker if skip_marker is not None else replace_str
+    if marker and marker in content:
         results["skipped"].append(f"{bn}: {name}")
         print(f"    [SKIP] {name}")
         return
@@ -240,80 +242,115 @@ def apply_patch(fp, name, find_str, replace_str, regex=None, replace_fn=None):
     print(f"    [FAIL] {name}")
 
 
+def _find_by_content(assets, *needles):
+    """Find first *.js file in assets that contains ALL needles."""
+    for f in glob.glob(os.path.join(assets, "*.js")):
+        try:
+            with open(f, encoding="utf-8") as fh:
+                c = fh.read()
+        except OSError:
+            continue
+        if all(n in c for n in needles):
+            return [f]
+    return []
+
+
+def _report_missing(module_name, hints):
+    """Record a module as failed because no target file was found."""
+    msg = f"<no file>: {module_name}（未找到目标文件；候选特征: {hints}）"
+    results["failed"].append(msg)
+    print(f"    [MISS] {module_name}（无目标文件，跳过）")
+
+
 def step_patch_js(assets):
     print(f"[5] 应用 JS 补丁...")
     print(f"    {assets}\n")
 
-    # ── 模块 1: Fast 模式 (3 补丁) ───────────────────────────────
-    print("  [模块 1] Fast 模式")
-    files = _find(assets, "use-is-fast-mode-enabled-*.js")
-    if not files:
-        files = _find(assets, "permissions-mode-helpers-*.js")
-        if files:
-            with open(files[0], encoding="utf-8") as fh:
-                if "authMethod" not in fh.read():
-                    files = []
-    if not files:
-        for f in glob.glob(os.path.join(assets, "*.js")):
-            with open(f, encoding="utf-8") as fh:
-                c = fh.read()
-            if "authMethod" in c and "models.some" in c:
-                files = [f]; break
-    for fp in files:
-        apply_patch(fp, "Fast 授权门控",
-            "return!(r?.authMethod!==`chatgpt`||a)", "return true",
-            r'return!\([a-zA-Z_$]+\?\.authMethod!==`chatgpt`\|\|[a-zA-Z_$]+\)',
-            lambda m: "return true")
-        apply_patch(fp, "Fast Hook 早期返回",
-            "if(i?.authMethod!==`chatgpt`||s){", "if(false&&i?.authMethod!==`chatgpt`||s){",
-            r'if\(([a-zA-Z_$]+)\?\.authMethod!==`chatgpt`\|\|([a-zA-Z_$]+)\)\{',
-            lambda m: f"if(false&&{m.group(1)}?.authMethod!==`chatgpt`||{m.group(2)}){{")
-        # replace_str 用带赋值上下文的完整形式，防止 "true" 误判为 SKIP
-        apply_patch(fp, "模型可用性检查",
-            "b=v?.models.some(m)??!1", "b=true",
-            r'([a-zA-Z_$])=([a-zA-Z_$]+)\.models\.some\([a-zA-Z_$]+\)\?\?!1',
-            lambda m: f"{m.group(1)}=true")
+    # ── 模块 1: Fast/Speed (service-tier 系统, v26.602+) ─────────
+    # 新版 Codex 把 Fast 模式重写为 service tier，旧的
+    # `authMethod!==chatgpt` / `models.some` 门控已整体下线。
+    print("  [模块 1] Fast / Speed (service tier)")
 
-    # ── 模块 2: 插件侧边栏 + i18n (2 补丁) ──────────────────────
-    print("\n  [模块 2] 插件侧边栏 + i18n")
+    # 1A: isServiceTierAllowed —— 让 UI 认为 apikey 也允许选择 service tier
+    files = _find(assets, "use-service-tier-settings-*.js")
+    if not files:
+        files = _find_by_content(assets, "isServiceTierAllowed", "authMethod===`chatgpt`")
+    if files:
+        for fp in files:
+            apply_patch(fp, "isServiceTierAllowed 门控",
+                None, None,
+                r'([a-zA-Z_$]+)=([a-zA-Z_$]+)\?\.authMethod===`chatgpt`(?=,)',
+                lambda m: f"{m.group(1)}=(!0/*svc-tier-patched*/||{m.group(2)}?.authMethod===`chatgpt`)",
+                skip_marker="/*svc-tier-patched*/")
+    else:
+        _report_missing("isServiceTierAllowed 门控",
+                        "use-service-tier-settings-*.js / isServiceTierAllowed")
+
+    # 1B: 请求时是否携带 service_tier —— 老版本仅 chatgpt 携带，新版同样如此
+    files = _find(assets, "read-service-tier-for-request-*.js")
+    if not files:
+        files = _find_by_content(assets, "fast_mode!==!1", "authMethod:n")
+    if files:
+        for fp in files:
+            # 仅把末尾的 :!1 改为 :!0，让非 chatgpt 也认为支持 fast mode
+            apply_patch(fp, "请求级 fast_mode 解锁",
+                "?.featureRequirements?.fast_mode!==!1:!1}",
+                "?.featureRequirements?.fast_mode!==!1:!0}",
+                r'\?\.featureRequirements\?\.fast_mode!==!1:!1\}',
+                lambda m: "?.featureRequirements?.fast_mode!==!1:!0}",
+                skip_marker="?.featureRequirements?.fast_mode!==!1:!0}")
+    else:
+        _report_missing("请求级 fast_mode 解锁",
+                        "read-service-tier-for-request-*.js / fast_mode")
+
+    # ── 模块 2: i18n 多语言 ──────────────────────────────────────
+    print("\n  [模块 2] i18n 多语言")
+    # 老版本 (useMemo) + 新版本 (React Forget cache) 都可能出现
     files = _find(assets, "app-main-*.js")
     if not files:
-        for f in glob.glob(os.path.join(assets, "*.js")):
-            with open(f, encoding="utf-8") as fh:
-                c = fh.read()
-            if "pluginsDisabledTooltip" in c and "enable_i18n" in c:
-                files = [f]; break
-    for fp in files:
-        apply_patch(fp, "插件侧边栏解锁",
-            "d?(0,$.jsx)(rf,{tooltipContent:(0,$.jsx)(Y,{id:`sidebarElectron.pluginsDisabledTooltip`",
-            "0?(0,$.jsx)(rf,{tooltipContent:(0,$.jsx)(Y,{id:`sidebarElectron.pluginsDisabledTooltip`",
-            r'([a-zA-Z_$])\?\(0,\$\.jsx\)\([a-zA-Z_$]+,\{tooltipContent:\(0,\$\.jsx\)\([a-zA-Z_$]+,\{id:`sidebarElectron\.pluginsDisabledTooltip`',
-            lambda m: m.group(0).replace(m.group(1) + "?", "0?", 1))
-        apply_patch(fp, "i18n 多语言强制启用",
-            "r=(0,Q.useMemo)(()=>n?.get(`enable_i18n`,!1),[n])",
-            "r=(0,Q.useMemo)(()=>!0,[n])",
-            r'([a-zA-Z_$])=\(0,[a-zA-Z_$]+\.useMemo\)\(\(\)=>[a-zA-Z_$]+\?\.get\(`enable_i18n`,!1\),\[[a-zA-Z_$]+\]\)',
-            lambda m: f"{m.group(1)}=(0,Q.useMemo)(()=>!0,[n])")
+        files = _find_by_content(assets, "enable_i18n", "sidebarElectron")
+    if files:
+        for fp in files:
+            # 新版: a?.get(`enable_i18n`,!1)  →  !0 (并保留原表达式作为死代码 + sentinel 以便重入识别)
+            apply_patch(fp, "i18n 强制启用 (新版)",
+                None, None,
+                r'([a-zA-Z_$]+)\?\.get\(`enable_i18n`,!1\)',
+                lambda m: f"(!0/*i18n-patched*/||{m.group(1)}?.get(`enable_i18n`,!1))",
+                skip_marker="/*i18n-patched*/")
+            # 老版: r=(0,Q.useMemo)(()=>n?.get(`enable_i18n`,!1),[n])
+            apply_patch(fp, "i18n 强制启用 (老版 useMemo)",
+                "r=(0,Q.useMemo)(()=>n?.get(`enable_i18n`,!1),[n])",
+                "r=(0,Q.useMemo)(()=>!0,[n])",
+                r'([a-zA-Z_$])=\(0,[a-zA-Z_$]+\.useMemo\)\(\(\)=>[a-zA-Z_$]+\?\.get\(`enable_i18n`,!1\),\[[a-zA-Z_$]+\]\)',
+                lambda m: f"{m.group(1)}=(0,Q.useMemo)(()=>!0,[n])")
+    else:
+        _report_missing("i18n 强制启用", "app-main-*.js / enable_i18n")
 
     # ── 模块 3: 插件连接器 (1 补丁) ──────────────────────────────
     print("\n  [模块 3] 插件连接器")
     files = _find(assets, "check-plugin-availability-*.js")
     if not files:
-        for f in glob.glob(os.path.join(assets, "*.js")):
-            with open(f, encoding="utf-8") as fh:
-                c = fh.read()
-            if "connector-unavailable" in c:
-                files = [f]; break
-    for fp in files:
-        apply_patch(fp, "插件连接器解锁",
-            "(i=`connector-unavailable`)", "false&&(i=`connector-unavailable`)",
-            r'\(([a-zA-Z_$])=`connector-unavailable`\)',
-            lambda m: f"false&&({m.group(1)}=`connector-unavailable`)")
+        files = _find_by_content(assets, "connector-unavailable")
+    if files:
+        for fp in files:
+            apply_patch(fp, "插件连接器解锁",
+                "(i=`connector-unavailable`)", "false&&(i=`connector-unavailable`)",
+                r'\(([a-zA-Z_$])=`connector-unavailable`\)',
+                lambda m: f"false&&({m.group(1)}=`connector-unavailable`)")
+    else:
+        _report_missing("插件连接器解锁",
+                        "check-plugin-availability-*.js / connector-unavailable")
 
     # ── 模块 4: 品牌视觉 (1 补丁) ────────────────────────────────
-    # 新版: plugin-auth-*.js  旧版: gradient-*.js
+    # v26.602+: use-plugins-*.js   旧版: plugin-auth-*.js / gradient-*.js
     print("\n  [模块 4] 品牌视觉")
-    files = _find(assets, "plugin-auth-*.js")
+    files = _find(assets, "use-plugins-*.js")
+    if files:
+        with open(files[0], encoding="utf-8") as fh:
+            if "!==`chatgpt`" not in fh.read():
+                files = []
+    if not files:
+        files = _find(assets, "plugin-auth-*.js")
     if not files:
         files = _find(assets, "gradient-*.js")
         if files:
@@ -321,47 +358,67 @@ def step_patch_js(assets):
                 if "chatgpt" not in fh.read():
                     files = []
     if not files:
+        # 通用：包含 `function X(Y){return Y!==`chatgpt`}` 的文件
         for f in glob.glob(os.path.join(assets, "*.js")):
             with open(f, encoding="utf-8") as fh:
                 c = fh.read()
-            if "function e(e){return e!==`chatgpt`}" in c:
+            if re.search(r'function\s+[a-zA-Z_$]+\([a-zA-Z_$]+\)\{return\s+[a-zA-Z_$]+!==`chatgpt`\}', c):
                 files = [f]; break
-    for fp in files:
-        apply_patch(fp, "品牌视觉统一",
-            "function e(e){return e!==`chatgpt`}", "function e(e){return false}",
-            r'function\s+([a-zA-Z_$]+)\(\1\)\{return\s+\1!==`chatgpt`\}',
-            lambda m: f"function {m.group(1)}({m.group(1)}){{return false}}")
+    if files:
+        for fp in files:
+            # 通用：匹配 function X(Y){return Y!==`chatgpt`}（X、Y 可同名也可不同名）
+            apply_patch(fp, "品牌视觉统一",
+                None, None,
+                r'function\s+([a-zA-Z_$]+)\(([a-zA-Z_$]+)\)\{return\s+\2!==`chatgpt`\}',
+                lambda m: f"function {m.group(1)}({m.group(2)}){{return false}}",
+                skip_marker="){return false}")
+    else:
+        _report_missing("品牌视觉统一", "use-plugins-*.js / `function X(Y){return Y!==chatgpt}`")
 
     # ── 模块 5: 语音输入 (1 补丁) ────────────────────────────────
     print("\n  [模块 5] 语音输入")
-    files = _find(assets, "annotation-comment-editor-card-*.js")
+    files = _find(assets, "use-is-dictation-supported-*.js")
+    if not files:
+        files = _find(assets, "annotation-comment-editor-card-*.js")
     if not files:
         for f in glob.glob(os.path.join(assets, "*.js")):
             with open(f, encoding="utf-8") as fh:
                 c = fh.read()
             if "authMethod===`chatgpt`" in c and "dictation" in c.lower():
                 files = [f]; break
-    for fp in files:
-        apply_patch(fp, "语音输入解锁",
-            "n&&t.authMethod===`chatgpt`",
-            "n&&(t.authMethod===`chatgpt`||t.authMethod===`apikey`)",
-            r'([a-zA-Z_$]+)&&([a-zA-Z_$]+)\.authMethod===`chatgpt`',
-            lambda m: f"{m.group(1)}&&({m.group(2)}.authMethod===`chatgpt`||{m.group(2)}.authMethod===`apikey`)")
+    if files:
+        for fp in files:
+            apply_patch(fp, "语音输入解锁",
+                "n&&t.authMethod===`chatgpt`",
+                "n&&(t.authMethod===`chatgpt`||t.authMethod===`apikey`)",
+                r'([a-zA-Z_$]+)&&([a-zA-Z_$]+)\.authMethod===`chatgpt`(?!\|\|)',
+                lambda m: f"{m.group(1)}&&({m.group(2)}.authMethod===`chatgpt`||{m.group(2)}.authMethod===`apikey`)")
+    else:
+        _report_missing("语音输入解锁",
+                        "use-is-dictation-supported-*.js / authMethod===chatgpt + dictation")
 
     # ── 模块 6: 用量设置 (1 补丁) ────────────────────────────────
     print("\n  [模块 6] 用量设置")
     files = _find(assets, "use-usage-settings-access-*.js")
     if not files:
-        for f in glob.glob(os.path.join(assets, "*.js")):
-            with open(f, encoding="utf-8") as fh:
-                c = fh.read()
-            if "let r=e===`chatgpt`" in c:
-                files = [f]; break
-    for fp in files:
-        apply_patch(fp, "用量设置解锁",
-            "let r=e===`chatgpt`", "let r=e===`chatgpt`||e===`apikey`",
-            r'let\s+([a-zA-Z_$]+)=([a-zA-Z_$]+)===`chatgpt`',
-            lambda m: f"let {m.group(1)}={m.group(2)}===`chatgpt`||{m.group(2)}===`apikey`")
+        files = _find_by_content(assets, "enable_free_go_usage_settings", "===`chatgpt`")
+    if files:
+        for fp in files:
+            # 新版有两处需要解锁的 ===`chatgpt`（外层 h=l===chatgpt, 内层 i=e===chatgpt）。
+            # 用 let X=Y===`chatgpt` 的通用 regex，把 chatgpt 扩展为 chatgpt||apikey。
+            apply_patch(fp, "用量设置解锁 (作用域外层 h)",
+                "h=l===`chatgpt`",
+                "h=l===`chatgpt`||l===`apikey`",
+                r'([a-zA-Z_$]+)=([a-zA-Z_$]+)===`chatgpt`(?=,)',
+                lambda m: f"{m.group(1)}={m.group(2)}===`chatgpt`||{m.group(2)}===`apikey`")
+            apply_patch(fp, "用量设置解锁 (作用域内层 i)",
+                "let i=e===`chatgpt`",
+                "let i=e===`chatgpt`||e===`apikey`",
+                r'let\s+([a-zA-Z_$]+)=([a-zA-Z_$]+)===`chatgpt`',
+                lambda m: f"let {m.group(1)}={m.group(2)}===`chatgpt`||{m.group(2)}===`apikey`")
+    else:
+        _report_missing("用量设置解锁",
+                        "use-usage-settings-access-*.js / ===chatgpt")
 
 
 # ================================================================
