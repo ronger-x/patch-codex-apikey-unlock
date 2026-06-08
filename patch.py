@@ -456,10 +456,54 @@ def step_fuses(exe_path):
 
 
 # ================================================================
+# 步骤 3 (仅 macOS): 复制官方 app 到独立副本
+# ================================================================
+# 说明: macOS TCC 权限(屏幕录制/辅助功能/自动化)绑定到代码的签名身份
+# (Designated Requirement)，而非 bundle id。若直接修改 /Applications/Codex.app
+# 并 ad-hoc 重签名，会让系统把它当成另一个 app，导致 Appshots/Computer Use
+# 依赖的权限失效(见 GitHub issue #1)。
+# 因此改为: 官方 app 原样保留(继续供 Appshots/Computer Use 使用)，
+# 补丁只打到 /Applications/Codex-Patched.app 副本上，副本仅用于 fast/plugins。
+PATCHED_APP_MACOS = "/Applications/Codex-Patched.app"
+
+
+def step_copy_macos(official_app):
+    """
+    将官方 Codex.app 复制到 Codex-Patched.app（保留所有属性/符号链接/扩展属性）。
+    返回 (patched_app, resources_dir, exe_path)
+    """
+    patched_app = PATCHED_APP_MACOS
+    resources   = os.path.join(patched_app, "Contents", "Resources")
+    exe         = os.path.join(patched_app, "Contents", "MacOS", "Codex")
+
+    print("[3] 复制官方 app 到独立副本...")
+    print(f"    {official_app}")
+    print(f"    -> {patched_app}")
+    print("    (官方 /Applications/Codex.app 保持不变，Appshots/Computer Use 不受影响)")
+
+    if DRY_RUN:
+        print("    [DRY-RUN] 跳过复制")
+        return patched_app, resources, exe
+
+    if os.path.exists(patched_app):
+        shutil.rmtree(patched_app)
+
+    # ditto 完整保留 bundle 结构、符号链接与扩展属性，得到与官方一致的初始副本
+    rc, _ = run_cmd(["ditto", official_app, patched_app])
+    if rc != 0:
+        _die("复制 Codex.app 失败，请确认有写入 /Applications 的权限。")
+
+    print("    复制完成。")
+    return patched_app, resources, exe
+
+
+# ================================================================
 # 步骤 7: 平台收尾
 # ================================================================
 def step_finish_macos(app_path):
-    print("[7] 重新签名 (macOS)...")
+    # 仅对 patched 副本做 ad-hoc 签名(修改 app.asar 后原签名失效，需重签才能启动)。
+    # 副本只用于 fast/plugins，不需要 TCC 权限，ad-hoc 足够；官方 app 不在此处理。
+    print("[7] 重新签名 (macOS 副本)...")
     if not DRY_RUN:
         run_cmd(["codesign", "--force", "--deep", "--sign", "-", app_path])
     print("    签名完成。")
@@ -506,7 +550,11 @@ else:
 
     source_root, resources_dir, exe_path, is_store = step_detect()
 
-    if IS_WINDOWS and is_store:
+    if IS_MACOS:
+        # 复制官方 app 到独立副本，补丁/签名只作用于副本，
+        # 官方 /Applications/Codex.app 保持 OpenAI 签名供 Appshots/Computer Use 使用。
+        work_root, resources_dir, exe_path = step_copy_macos(source_root)
+    elif IS_WINDOWS and is_store:
         patch_root, resources_dir, exe_path = step_copy_store(source_root)
         work_root = patch_root
     else:
@@ -526,7 +574,7 @@ else:
     step_fuses(exe_path)
 
     if IS_MACOS:
-        step_finish_macos(source_root)
+        step_finish_macos(work_root)
     elif IS_WINDOWS and is_store:
         step_shortcut_windows(exe_path, work_root)
 
@@ -565,5 +613,7 @@ if not args.assets:
     elif IS_WINDOWS:
         print("  补丁完成！直接启动 Codex 即可。")
     elif IS_MACOS:
-        print("  补丁完成！启动 /Applications/Codex.app。")
+        print(f"  补丁完成！启动打补丁的副本: {PATCHED_APP_MACOS}")
+        print("  官方 /Applications/Codex.app 保持不变，Appshots/Computer Use 仍可正常使用。")
+        print("  (副本用于 fast/plugins，官方版用于 Appshots/Computer Use)")
 print()
