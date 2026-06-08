@@ -438,7 +438,7 @@ def step_fuses(exe_path):
     no_sentinel = False
     for flag in flags:
         rc, out = run_cmd(
-            ["npx", "@electron/fuses", "write", "--app", exe_path, flag],
+            ["npx", "--yes", "@electron/fuses", "write", "--app", exe_path, flag],
             capture=True)
         if rc != 0:
             if "sentinel" in out.lower():
