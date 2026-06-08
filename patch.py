@@ -148,9 +148,11 @@ def step_copy_store(store_root):
     os.makedirs(patch_root, exist_ok=True)
 
     # /COPY:DAT 只复制数据/属性/时间戳，跳过 EFS 加密属性（WindowsApps 目录限制）
+    # /NP 不显示进度百分比（避免刷屏），但保留目录/文件列表让用户知道在工作
+    print("    复制中，这可能需要 1-2 分钟...")
     rc, _ = run_cmd(
         ["robocopy", src, patch_root,
-         "/E", "/COPY:DAT", "/NP", "/NFL", "/NDL", "/NJH", "/NJS"]
+         "/E", "/COPY:DAT", "/NP", "/NDL", "/NJH", "/NJS"]
     )
     if rc >= 8:
         _die(f"robocopy 失败 (exit {rc})，请以管理员身份运行。")
@@ -162,38 +164,79 @@ def step_copy_store(store_root):
 # ================================================================
 # 步骤 4: 备份 + 提取 app.asar
 # ================================================================
+# 说明: Codex 使用 OpenAI 定制的 "owl" Electron 运行时，它只从
+# resources/app.asar 加载，不会像标准 Electron 那样回退到 app/ 文件夹，
+# 且不暴露标准 fuse wire（无法用 @electron/fuses 关闭 OnlyLoadAppFromAsar）。
+# 因此流程为: 从 app.asar.bak(原始) 提取 -> 打补丁 -> 重新打包回 app.asar。
 def step_extract_asar(resources_dir):
     print("[4] 提取 app.asar...")
 
     asar     = os.path.join(resources_dir, "app.asar")
     asar_bak = os.path.join(resources_dir, "app.asar.bak")
-    asar1    = os.path.join(resources_dir, "app.asar1")
     app_dir  = os.path.join(resources_dir, "app")
 
-    if not os.path.isfile(asar) and os.path.isdir(app_dir):
-        print("    app/ 已存在（之前已解包），跳过。")
-        return
-
-    if not os.path.isfile(asar):
+    if not os.path.isfile(asar) and not os.path.isfile(asar_bak):
         _die(f"未找到 app.asar: {asar}")
 
     if DRY_RUN:
         print("    [DRY-RUN] 跳过 asar 提取")
         return
 
+    # 备份原始 asar（仅首次）。
     if not os.path.isfile(asar_bak):
         shutil.copy2(asar, asar_bak)
         print("    已备份 app.asar -> app.asar.bak")
 
+    # 从 app.asar 提取。electron/asar 会自动合并同名 sidecar
+    # (app.asar.unpacked) 中的原生模块文件，因此必须从 app.asar 提取，
+    # 而非从 app.asar.bak（其 sidecar 名不匹配会导致 ENOENT）。
+    # 补丁已幂等，即使 app.asar 已被打过补丁，重新提取+打补丁也安全。
     if os.path.isdir(app_dir):
         shutil.rmtree(app_dir)
 
     rc, _ = run_cmd(["npx", "--yes", "@electron/asar", "e", asar, app_dir])
     if rc != 0:
         _die("asar 提取失败，请确认 Node.js 已安装（npx 可用）。")
+    print("    提取到 app/ 完成。")
 
-    os.rename(asar, asar1)
-    print("    提取完成，app.asar -> app.asar1")
+
+# ================================================================
+# 步骤 4.5: 重新打包 app/ -> app.asar
+# ================================================================
+def step_repack_asar(resources_dir):
+    print("\n[5.5] 重新打包 app/ -> app.asar...")
+
+    asar      = os.path.join(resources_dir, "app.asar")
+    app_dir   = os.path.join(resources_dir, "app")
+    unpacked  = os.path.join(resources_dir, "app.asar.unpacked")
+
+    if DRY_RUN:
+        print("    [DRY-RUN] 跳过重新打包")
+        return
+
+    if not os.path.isdir(app_dir):
+        _die(f"app/ 目录不存在，无法打包: {app_dir}")
+
+    # 清理旧的 unpacked，避免残留
+    if os.path.isdir(unpacked):
+        shutil.rmtree(unpacked)
+
+    # 原生模块 (.node) 及 node-pty/better-sqlite3 必须解包到磁盘，
+    # 否则 Electron 无法 dlopen 原生扩展。
+    rc, _ = run_cmd([
+        "npx", "--yes", "@electron/asar", "pack", app_dir, asar,
+        "--unpack-dir", "{**/node_modules/node-pty,**/node_modules/better-sqlite3}",
+        "--unpack", "**/*.node",
+    ])
+    if rc != 0:
+        _die("asar 打包失败。")
+
+    # 清理可能残留的旧式 app.asar1（历史版本产物）
+    asar1 = os.path.join(resources_dir, "app.asar1")
+    if os.path.isfile(asar1):
+        os.remove(asar1)
+
+    print("    打包完成，补丁已写入 app.asar（原生模块已解包）。")
 
 
 # ================================================================
@@ -206,11 +249,18 @@ def _find(base, pattern):
     return glob.glob(os.path.join(base, pattern))
 
 
-def apply_patch(fp, name, find_str, replace_str, regex=None, replace_fn=None):
+def apply_patch(fp, name, find_str, replace_str, regex=None, replace_fn=None, skip_regex=None):
     with open(fp, encoding="utf-8") as f:
         content = f.read()
     bn = os.path.basename(fp)
 
+    # 使用自定义 skip_regex 检测补丁是否已应用（优先级最高）
+    if skip_regex and re.search(skip_regex, content):
+        results["skipped"].append(f"{bn}: {name}")
+        print(f"    [SKIP] {name}")
+        return
+
+    # 使用 replace_str 检测补丁是否已应用（向后兼容）
     if replace_str and replace_str in content:
         results["skipped"].append(f"{bn}: {name}")
         print(f"    [SKIP] {name}")
@@ -244,56 +294,48 @@ def step_patch_js(assets):
     print(f"[5] 应用 JS 补丁...")
     print(f"    {assets}\n")
 
-    # ── 模块 1: Fast 模式 (3 补丁) ───────────────────────────────
-    print("  [模块 1] Fast 模式")
-    files = _find(assets, "use-is-fast-mode-enabled-*.js")
+    # ── 模块 1: Fast 模式 / 服务层级 (1 补丁) ────────────────────
+    # 新版 (26.602+): 逻辑迁移到 use-service-tier-settings-*.js
+    #   函数 A 中 a=i?.authMethod===`chatgpt` 门控 isServiceTierAllowed，
+    #   将 a 强制为真即解锁 apikey 的 Fast / 服务层级选择。
+    # 旧版: use-is-fast-mode-enabled-*.js (含 canUseFastMode)
+    print("  [模块 1] Fast 模式 / 服务层级")
+    files = _find(assets, "use-service-tier-settings-*.js")
     if not files:
-        files = _find(assets, "permissions-mode-helpers-*.js")
-        if files:
-            with open(files[0], encoding="utf-8") as fh:
-                if "authMethod" not in fh.read():
-                    files = []
+        files = _find(assets, "use-is-fast-mode-enabled-*.js")
     if not files:
         for f in glob.glob(os.path.join(assets, "*.js")):
             with open(f, encoding="utf-8") as fh:
                 c = fh.read()
-            if "authMethod" in c and "models.some" in c:
+            if "isServiceTierAllowed" in c and "authMethod===`chatgpt`" in c:
                 files = [f]; break
     for fp in files:
-        apply_patch(fp, "Fast 授权门控",
-            "return!(r?.authMethod!==`chatgpt`||a)", "return true",
-            r'return!\([a-zA-Z_$]+\?\.authMethod!==`chatgpt`\|\|[a-zA-Z_$]+\)',
-            lambda m: "return true")
-        apply_patch(fp, "Fast Hook 早期返回",
-            "if(i?.authMethod!==`chatgpt`||s){", "if(false&&i?.authMethod!==`chatgpt`||s){",
-            r'if\(([a-zA-Z_$]+)\?\.authMethod!==`chatgpt`\|\|([a-zA-Z_$]+)\)\{',
-            lambda m: f"if(false&&{m.group(1)}?.authMethod!==`chatgpt`||{m.group(2)}){{")
-        # replace_str 用带赋值上下文的完整形式，防止 "true" 误判为 SKIP
-        apply_patch(fp, "模型可用性检查",
-            "b=v?.models.some(m)??!1", "b=true",
-            r'([a-zA-Z_$])=([a-zA-Z_$]+)\.models\.some\([a-zA-Z_$]+\)\?\?!1',
-            lambda m: f"{m.group(1)}=true")
+        # a=i?.authMethod===`chatgpt`,o=i?.authMethod??null  →  a=true||...
+        # 保留 chatgpt 标记用于幂等 SKIP 检测
+        apply_patch(fp, "服务层级授权门控",
+            None, None,
+            r'([a-zA-Z_$]+)=([a-zA-Z_$]+)\?\.authMethod===`chatgpt`,([a-zA-Z_$]+)=\2\?\.authMethod\?\?null',
+            lambda m: f"{m.group(1)}=true||{m.group(2)}?.authMethod===`chatgpt`,{m.group(3)}={m.group(2)}?.authMethod??null",
+            skip_regex=r'=true\|\|[a-zA-Z_$]+\?\.authMethod===`chatgpt`,[a-zA-Z_$]+=[a-zA-Z_$]+\?\.authMethod\?\?null')
 
-    # ── 模块 2: 插件侧边栏 + i18n (2 补丁) ──────────────────────
-    print("\n  [模块 2] 插件侧边栏 + i18n")
+    # ── 模块 2: i18n 多语言 (1 补丁) ────────────────────────────
+    # 新版: app-main 中 React Compiler 形式 s=a?.get(`enable_i18n`,!1)
+    # 旧版: r=(0,Q.useMemo)(()=>n?.get(`enable_i18n`,!1),[n])
+    # 注: 旧版"插件侧边栏 (pluginsDisabledTooltip)"已被移除，
+    #     插件门控现由模块 4 的 ge() 函数统一控制。
+    print("\n  [模块 2] i18n 多语言")
     files = _find(assets, "app-main-*.js")
     if not files:
         for f in glob.glob(os.path.join(assets, "*.js")):
             with open(f, encoding="utf-8") as fh:
-                c = fh.read()
-            if "pluginsDisabledTooltip" in c and "enable_i18n" in c:
-                files = [f]; break
+                if "enable_i18n" in fh.read():
+                    files = [f]; break
     for fp in files:
-        apply_patch(fp, "插件侧边栏解锁",
-            "d?(0,$.jsx)(rf,{tooltipContent:(0,$.jsx)(Y,{id:`sidebarElectron.pluginsDisabledTooltip`",
-            "0?(0,$.jsx)(rf,{tooltipContent:(0,$.jsx)(Y,{id:`sidebarElectron.pluginsDisabledTooltip`",
-            r'([a-zA-Z_$])\?\(0,\$\.jsx\)\([a-zA-Z_$]+,\{tooltipContent:\(0,\$\.jsx\)\([a-zA-Z_$]+,\{id:`sidebarElectron\.pluginsDisabledTooltip`',
-            lambda m: m.group(0).replace(m.group(1) + "?", "0?", 1))
         apply_patch(fp, "i18n 多语言强制启用",
-            "r=(0,Q.useMemo)(()=>n?.get(`enable_i18n`,!1),[n])",
-            "r=(0,Q.useMemo)(()=>!0,[n])",
-            r'([a-zA-Z_$])=\(0,[a-zA-Z_$]+\.useMemo\)\(\(\)=>[a-zA-Z_$]+\?\.get\(`enable_i18n`,!1\),\[[a-zA-Z_$]+\]\)',
-            lambda m: f"{m.group(1)}=(0,Q.useMemo)(()=>!0,[n])")
+            None, None,
+            r'([a-zA-Z_$]+)=([a-zA-Z_$]+)\?\.get\(`enable_i18n`,!1\)',
+            lambda m: f"{m.group(1)}=true||{m.group(2)}?.get(`enable_i18n`,!1)",
+            skip_regex=r'=true\|\|[a-zA-Z_$]+\?\.get\(`enable_i18n`,!1\)')
 
     # ── 模块 3: 插件连接器 (1 补丁) ──────────────────────────────
     print("\n  [模块 3] 插件连接器")
@@ -307,13 +349,19 @@ def step_patch_js(assets):
     for fp in files:
         apply_patch(fp, "插件连接器解锁",
             "(i=`connector-unavailable`)", "false&&(i=`connector-unavailable`)",
-            r'\(([a-zA-Z_$])=`connector-unavailable`\)',
-            lambda m: f"false&&({m.group(1)}=`connector-unavailable`)")
+            r'(?<!&&)\(([a-zA-Z_$])=`connector-unavailable`\)',
+            lambda m: f"false&&({m.group(1)}=`connector-unavailable`)",
+            skip_regex=r'false&&\([a-zA-Z_$]=`connector-unavailable`\)')
 
-    # ── 模块 4: 品牌视觉 (1 补丁) ────────────────────────────────
-    # 新版: plugin-auth-*.js  旧版: gradient-*.js
-    print("\n  [模块 4] 品牌视觉")
-    files = _find(assets, "plugin-auth-*.js")
+    # ── 模块 4: 品牌视觉 + 插件门控 (1 补丁) ─────────────────────
+    # 新版 (26.602+): use-plugins-*.js 中 function ge(e){return e!==`chatgpt`}
+    #   该函数同时控制品牌视觉与插件侧边栏可用性。
+    #   注意: 函数名(ge) 与参数名(e) 不再相同。
+    # 旧版: plugin-auth-*.js / gradient-*.js
+    print("\n  [模块 4] 品牌视觉 + 插件门控")
+    files = _find(assets, "use-plugins-*.js")
+    if not files:
+        files = _find(assets, "plugin-auth-*.js")
     if not files:
         files = _find(assets, "gradient-*.js")
         if files:
@@ -323,30 +371,37 @@ def step_patch_js(assets):
     if not files:
         for f in glob.glob(os.path.join(assets, "*.js")):
             with open(f, encoding="utf-8") as fh:
-                c = fh.read()
-            if "function e(e){return e!==`chatgpt`}" in c:
-                files = [f]; break
+                if re.search(r'function [a-zA-Z_$]+\([a-zA-Z_$]+\)\{return [a-zA-Z_$]+!==`chatgpt`\}', fh.read()):
+                    files = [f]; break
     for fp in files:
-        apply_patch(fp, "品牌视觉统一",
-            "function e(e){return e!==`chatgpt`}", "function e(e){return false}",
-            r'function\s+([a-zA-Z_$]+)\(\1\)\{return\s+\1!==`chatgpt`\}',
-            lambda m: f"function {m.group(1)}({m.group(1)}){{return false}}")
+        # function ge(e){return e!==`chatgpt`}  →  {return false&&e!==`chatgpt`}
+        apply_patch(fp, "品牌视觉/插件统一",
+            None, None,
+            r'function ([a-zA-Z_$]+)\(([a-zA-Z_$]+)\)\{return \2!==`chatgpt`\}',
+            lambda m: f"function {m.group(1)}({m.group(2)}){{return false&&{m.group(2)}!==`chatgpt`}}",
+            skip_regex=r'function [a-zA-Z_$]+\([a-zA-Z_$]+\)\{return false&&[a-zA-Z_$]+!==`chatgpt`\}')
 
     # ── 模块 5: 语音输入 (1 补丁) ────────────────────────────────
+    # 新版 (26.602+): use-is-dictation-supported-*.js 中 n&&t.authMethod===`chatgpt`
+    # 旧版: annotation-comment-editor-card-*.js
     print("\n  [模块 5] 语音输入")
-    files = _find(assets, "annotation-comment-editor-card-*.js")
+    files = _find(assets, "use-is-dictation-supported-*.js")
     if not files:
+        files = _find(assets, "annotation-comment-editor-card-*.js")
+    if not files:
+        # 精确匹配：含 dictation 判定模式的文件，避免误选 app-main
         for f in glob.glob(os.path.join(assets, "*.js")):
             with open(f, encoding="utf-8") as fh:
                 c = fh.read()
-            if "authMethod===`chatgpt`" in c and "dictation" in c.lower():
+            if "dictation" in c.lower() and re.search(
+                    r'[a-zA-Z_$]+&&[a-zA-Z_$]+\.authMethod===`chatgpt`', c):
                 files = [f]; break
     for fp in files:
         apply_patch(fp, "语音输入解锁",
-            "n&&t.authMethod===`chatgpt`",
-            "n&&(t.authMethod===`chatgpt`||t.authMethod===`apikey`)",
-            r'([a-zA-Z_$]+)&&([a-zA-Z_$]+)\.authMethod===`chatgpt`',
-            lambda m: f"{m.group(1)}&&({m.group(2)}.authMethod===`chatgpt`||{m.group(2)}.authMethod===`apikey`)")
+            None, None,
+            r'([a-zA-Z_$]+)&&([a-zA-Z_$]+)\.authMethod===`chatgpt`(?!\|\|)',
+            lambda m: f"{m.group(1)}&&({m.group(2)}.authMethod===`chatgpt`||{m.group(2)}.authMethod===`apikey`)",
+            skip_regex=r'authMethod===`chatgpt`\|\|[a-zA-Z_$]+\.authMethod===`apikey`')
 
     # ── 模块 6: 用量设置 (1 补丁) ────────────────────────────────
     print("\n  [模块 6] 用量设置")
@@ -354,14 +409,14 @@ def step_patch_js(assets):
     if not files:
         for f in glob.glob(os.path.join(assets, "*.js")):
             with open(f, encoding="utf-8") as fh:
-                c = fh.read()
-            if "let r=e===`chatgpt`" in c:
-                files = [f]; break
+                if re.search(r'let [a-zA-Z_$]+=[a-zA-Z_$]+===`chatgpt`', fh.read()):
+                    files = [f]; break
     for fp in files:
         apply_patch(fp, "用量设置解锁",
             "let r=e===`chatgpt`", "let r=e===`chatgpt`||e===`apikey`",
-            r'let\s+([a-zA-Z_$]+)=([a-zA-Z_$]+)===`chatgpt`',
-            lambda m: f"let {m.group(1)}={m.group(2)}===`chatgpt`||{m.group(2)}===`apikey`")
+            r'let\s+([a-zA-Z_$]+)=([a-zA-Z_$]+)===`chatgpt`(?!\|\|)',
+            lambda m: f"let {m.group(1)}={m.group(2)}===`chatgpt`||{m.group(2)}===`apikey`",
+            skip_regex=r'let [a-zA-Z_$]+=[a-zA-Z_$]+===`chatgpt`\|\|[a-zA-Z_$]+===`apikey`')
 
 
 # ================================================================
@@ -375,10 +430,29 @@ def step_fuses(exe_path):
         "GrantFileProtocolExtraPrivileges=off",
         "EnableCookieEncryption=off",
     ]
+    if DRY_RUN:
+        for flag in flags:
+            print(f"    {flag}")
+        return
+
+    no_sentinel = False
     for flag in flags:
-        if not DRY_RUN:
-            run_cmd(["npx", "@electron/fuses", "write", "--app", exe_path, flag])
-        print(f"    {flag}")
+        rc, out = run_cmd(
+            ["npx", "@electron/fuses", "write", "--app", exe_path, flag],
+            capture=True)
+        if rc != 0:
+            if "sentinel" in out.lower():
+                no_sentinel = True
+            print(f"    [跳过] {flag}")
+        else:
+            print(f"    {flag}")
+
+    if no_sentinel:
+        # OpenAI 的 owl Electron 构建未暴露标准 fuse wire（找不到 sentinel）。
+        # 这是预期情况，且不影响补丁：补丁已重新打包进 app.asar，
+        # 通过正常的 asar 加载路径生效，无需修改任何 fuse。
+        print("    注: 此 Electron 构建未暴露 fuses（找不到 sentinel），属正常现象。")
+        print("        补丁已写入 app.asar，无需 fuses 即可生效。")
 
 
 # ================================================================
@@ -444,6 +518,10 @@ else:
     if not os.path.isdir(assets) and not DRY_RUN:
         _die(f"assets 目录不存在: {assets}")
     step_patch_js(assets)
+
+    # 关键: 将打好补丁的 app/ 重新打包回 app.asar
+    # (owl 运行时只从 app.asar 加载，不支持 app/ 文件夹回退)
+    step_repack_asar(resources_dir)
 
     step_fuses(exe_path)
 
