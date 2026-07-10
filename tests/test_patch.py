@@ -167,6 +167,9 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
             desktop_features = fixture["desktop_features"]
             desktop_feature_sync = fixture["desktop_feature_sync"]
             model_filter_source = fixture["model_filter_source"]
+            desktop_features.write_text(
+                desktop_features.read_text("utf-8") + ";(0)", encoding="utf-8"
+            )
 
             first = self.run_patch(assets)
             self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
@@ -235,6 +238,9 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
                 "function useCodexApiKeyAuth(){return(0,React.useContext)(x)"
                 "?.authMethod===`apikey`}",
                 feature_content,
+            )
+            self.assertIn(
+                ";(0);\nfunction useCodexApiKeyAuth()", feature_content
             )
             self.assertIn(
                 "gate=[statsig(`1506311413`),useCodexApiKeyAuth()]"

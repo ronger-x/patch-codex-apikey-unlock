@@ -607,11 +607,18 @@ def apply_browser_computer_use_gate_patch(fp):
         if helper_definition is not None:
             source_map = re.search(r'(?m)^//# sourceMappingURL=', content)
             insert_at = source_map.start() if source_map else len(content)
-            separator = "\n" if source_map else ""
+            before_helper = content[:insert_at]
+            separator = (
+                ""
+                if not before_helper or before_helper[-1] in ";\r\n"
+                else ";\n"
+            )
+            suffix = "\n" if source_map else ""
             content = (
-                content[:insert_at]
-                + helper_definition
+                before_helper
                 + separator
+                + helper_definition
+                + suffix
                 + content[insert_at:]
             )
         with open(fp, "w", encoding="utf-8") as fh:
