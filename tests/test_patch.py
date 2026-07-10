@@ -609,6 +609,31 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
             )
             retry_delete.assert_called_once_with(r"C:\Codex-Patched\file")
 
+    def test_rmtree_callback_preserves_non_permission_traceback(self):
+        class TrackedOSError(OSError):
+            restored_traceback = None
+
+            def with_traceback(self, traceback):
+                self.restored_traceback = traceback
+                return super().with_traceback(traceback)
+
+        with loaded_patch_module() as patch_module:
+            try:
+                raise TrackedOSError("unexpected cleanup failure")
+            except TrackedOSError:
+                exc_info = sys.exc_info()
+
+            try:
+                patch_module._rmtree_clear_readonly(
+                    mock.Mock(), r"C:\Codex-Patched\file", exc_info
+                )
+            except TrackedOSError as raised:
+                self.assertIs(raised, exc_info[1])
+            else:
+                self.fail("non-PermissionError was not re-raised")
+
+            self.assertIs(exc_info[1].restored_traceback, exc_info[2])
+
     def test_windows_store_copy_stops_when_old_copy_cannot_be_removed(self):
         with loaded_patch_module() as patch_module, tempfile.TemporaryDirectory() as tmp:
             patch_module.DRY_RUN = False

@@ -290,7 +290,7 @@ def _rmtree_clear_readonly(function, path, exc_info):
     """shutil.rmtree callback for read-only files copied from WindowsApps."""
     error = exc_info[1]
     if not isinstance(error, PermissionError):
-        raise error
+        raise error.with_traceback(exc_info[2])
     os.chmod(path, stat.S_IWRITE)
     function(path)
 
