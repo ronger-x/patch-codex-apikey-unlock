@@ -504,7 +504,36 @@ def apply_browser_computer_use_gate_patch(fp):
         return
     react, context = auth_context
     identifier = r'[a-zA-Z_$][a-zA-Z0-9_$]*'
+    helper_pattern = re.compile(
+        rf'function[ \t]+(?P<helper>{identifier})[ \t]*\(\)[ \t]*\{{'
+        rf'[ \t]*return[ \t]*\(0,{re.escape(react)}\.useContext\)\('
+        rf'{re.escape(context)}\)\?\.authMethod===`apikey`[ \t]*\}}'
+    )
+    helper_matches = list(helper_pattern.finditer(content))
+    if len(helper_matches) > 1:
+        mark_missing(f"{bn}: Browser / Computer Use API key 范围", "认证 hook 不明确")
+        return
+    helper_definition = None
+    if helper_matches:
+        helper = helper_matches[0].group("helper")
+    else:
+        used_identifiers = set(re.findall(identifier, content))
+        helper = "useCodexApiKeyAuth"
+        suffix = 2
+        while helper in used_identifiers:
+            helper = f"useCodexApiKeyAuth{suffix}"
+            suffix += 1
+        helper_definition = (
+            f"function {helper}(){{return(0,{react}.useContext)({context})"
+            "?.authMethod===`apikey`}"
+        )
+
     patched_assignment_pattern = re.compile(
+        rf'(?P<gate>{identifier})=\[(?P<hook>{identifier})\('
+        rf'`(?P<gate_id>[0-9]+)`\),(?P<helper>{identifier})\(\)\]'
+        rf'\.some\(Boolean\)'
+    )
+    legacy_assignment_pattern = re.compile(
         rf'(?P<gate>{identifier})=\[(?P<hook>{identifier})\('
         rf'`(?P<gate_id>[0-9]+)`\),\(0,{re.escape(react)}\.useContext\)\('
         rf'{re.escape(context)}\)\?\.authMethod===`apikey`\]\.some\(Boolean\)'
@@ -527,13 +556,29 @@ def apply_browser_computer_use_gate_patch(fp):
                     for match in matches
                 )
             for match in patched_assignment_pattern.finditer(function_body):
+                if match.group("helper") != helper:
+                    continue
                 gate = match.group("gate")
                 if re.search(
                         rf'{re.escape(availability_field)}[ \t]*:[ \t]*'
                         rf'{re.escape(gate)}(?=[,}}])',
                         function_body[match.end():]):
                     candidates.append(
-                        (start + match.start(), start + match.end(), match, True)
+                        (
+                            start + match.start(),
+                            start + match.end(),
+                            match,
+                            True,
+                        )
+                    )
+            for match in legacy_assignment_pattern.finditer(function_body):
+                gate = match.group("gate")
+                if re.search(
+                        rf'{re.escape(availability_field)}[ \t]*:[ \t]*'
+                        rf'{re.escape(gate)}(?=[,}}])',
+                        function_body[match.end():]):
+                    candidates.append(
+                        (start + match.start(), start + match.end(), match, False)
                     )
 
         if len(candidates) != 1:
@@ -550,8 +595,7 @@ def apply_browser_computer_use_gate_patch(fp):
             continue
         replacement = (
             f"{match.group('gate')}=[{match.group('hook')}"
-            f"(`{match.group('gate_id')}`),(0,{react}.useContext)({context})"
-            "?.authMethod===`apikey`].some(Boolean)"
+            f"(`{match.group('gate_id')}`),{helper}()].some(Boolean)"
         )
         replacements.append((start, end, replacement, patch_name))
 
@@ -560,6 +604,16 @@ def apply_browser_computer_use_gate_patch(fp):
     if not DRY_RUN and replacements:
         for start, end, replacement, _ in sorted(replacements, reverse=True):
             content = content[:start] + replacement + content[end:]
+        if helper_definition is not None:
+            source_map = re.search(r'(?m)^//# sourceMappingURL=', content)
+            insert_at = source_map.start() if source_map else len(content)
+            separator = "\n" if source_map else ""
+            content = (
+                content[:insert_at]
+                + helper_definition
+                + separator
+                + content[insert_at:]
+            )
         with open(fp, "w", encoding="utf-8") as fh:
             fh.write(content)
     for _, _, _, patch_name in replacements:
@@ -633,6 +687,60 @@ def apply_computer_use_node_repl_gate_patch(fp):
             fh.write(content)
     results["applied"].append(f"{bn}: {patch_name}")
     print(f"    [OK]   {patch_name}")
+
+
+def _desktop_main_build(assets):
+    normalized = os.path.normpath(assets)
+    if (os.path.basename(normalized) != "assets" or
+            os.path.basename(os.path.dirname(normalized)) != "webview"):
+        return None
+    return os.path.join(
+        os.path.dirname(os.path.dirname(normalized)), ".vite", "build"
+    )
+
+
+def apply_windows_app_user_model_id_patch(main_build):
+    """Give the patched Windows copy a taskbar identity distinct from Store Codex."""
+    identifier = r'[a-zA-Z_$][a-zA-Z0-9_$]*'
+    original = re.compile(
+        rf'case[ \t]+(?P<flavor>{identifier})\.Prod[ \t]*:[ \t]*'
+        r'return[ \t]*`com\.openai\.codex`'
+    )
+    patched = re.compile(
+        rf'case[ \t]+{identifier}\.Prod[ \t]*:[ \t]*'
+        r'return[ \t]*`com\.openai\.codex\.patched`'
+    )
+    candidates = []
+    feature_present = False
+    for fp in _find(main_build, "file-based-logger-*.js"):
+        with open(fp, encoding="utf-8") as fh:
+            content = fh.read()
+        feature_present = (
+            feature_present
+            or (".Prod" in content and "com.openai.codex" in content)
+        )
+        if original.search(content) or patched.search(content):
+            candidates.append(fp)
+
+    target = _single_patch_target(
+        candidates,
+        "Windows 任务栏独立身份",
+        required=feature_present,
+    )
+    if target is None:
+        return
+    apply_patch(
+        target,
+        "Windows 任务栏独立身份",
+        None,
+        None,
+        original.pattern,
+        lambda match: (
+            f"case {match.group('flavor')}.Prod:"
+            "return`com.openai.codex.patched`"
+        ),
+        skip_regex=patched.pattern,
+    )
 
 
 def apply_browser_peer_authorization_patch(fp):
@@ -1060,6 +1168,7 @@ def apply_reasoning_effort_filter_patch(fp, validate_only=False):
 def step_patch_js(assets):
     print(f"[5] 应用 JS 补丁...")
     print(f"    {assets}\n")
+    main_build = _desktop_main_build(assets)
 
     # ── 模块 1: Fast 模式 / 服务层级 (2 补丁) ────────────────────
     # 新版 (26.602+): 逻辑迁移到 use-service-tier-settings-*.js
@@ -1267,17 +1376,9 @@ def step_patch_js(assets):
     # responsible-process 链返回 missing-code-signing-identity，即便实际的
     # node -> codex sandbox -> node_repl 都保留 OpenAI 签名。只对此原因降级，
     # 继续保留 untrusted identity 与 missing fd 的拒绝路径。
-    main_build = None
-    if (IS_MACOS and
-            os.path.basename(os.path.normpath(assets)) == "assets" and
-            os.path.basename(os.path.dirname(os.path.normpath(assets))) ==
-            "webview"):
-        main_build = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.normpath(assets))),
-            ".vite", "build")
     peer_auth_files = []
     peer_auth_feature_present = False
-    if main_build and os.path.isdir(main_build):
+    if IS_MACOS and main_build and os.path.isdir(main_build):
         for fp in _find(main_build, "main-*.js"):
             with open(fp, encoding="utf-8") as fh:
                 content = fh.read()
@@ -1393,6 +1494,12 @@ def step_patch_js(assets):
             r'let\s+([a-zA-Z_$]+)=([a-zA-Z_$]+)===`chatgpt`(?!\|\|)',
             lambda m: f"let {m.group(1)}={m.group(2)}===`chatgpt`||{m.group(2)}===`apikey`",
             skip_regex=r'let [a-zA-Z_$]+=[a-zA-Z_$]+===`chatgpt`\|\|[a-zA-Z_$]+===`apikey`')
+
+    # Store/传统安装与独立副本共用官方 AUMID 时，任务栏固定项会重新打开
+    # Store 版。只在 Windows 副本中分配独立身份，macOS bundle 保持不变。
+    if IS_WINDOWS and main_build and os.path.isdir(main_build):
+        print("\n  [模块 9] Windows 任务栏身份")
+        apply_windows_app_user_model_id_patch(main_build)
 
 
 def _require_successful_js_patch():
