@@ -1,33 +1,31 @@
 ---
 name: patch-codex-apikey-unlock
 description: |
-  Patch Codex App (macOS/Windows) - API Key 模式全功能解锁。
-  使 API key 模式拥有与 ChatGPT 账号模式完全相同的功能，包括：
-  Fast/Speed 模式、Plugins 插件、语音输入、用量设置、多语言 i18n、品牌视觉。
-  支持版本自动发现，当 Codex 更新后文件名 hash 变化时自动定位目标文件。
-version: 3.0.0
+  Patch ChatGPT Codex (macOS/Windows) - API Key 模式功能解锁。
+  兼容 ChatGPT/Codex 双品牌名称，显示 app-server 返回的最新隐藏模型，
+  并解除 Fast/Speed 模式的 UI 与请求级认证门控。
+version: 4.0.0
 ---
 
-# Patch Codex App - API Key 模式全功能解锁
+# Patch ChatGPT Codex - API Key 模式功能解锁
 
 ## 方案概述
 
-放弃 ChatGPT 账号登录模式，使用 API key 模式并解锁全部功能。
-无需配置代理、无需处理 OAuth 路由，只需一次补丁即可获得完整体验。
+使用 API key 模式时，解除桌面端仍依赖 ChatGPT 登录上下文的前端门控。
+
+已验证 Windows Store `26.707.3748.0`（app `26.707.31428`）：显示名与主入口为 `ChatGPT` / `ChatGPT.exe`，MSIX 包身份仍为 `OpenAI.Codex`。脚本对这三者分别检测，并保留旧 Codex 名称回退。
 
 ### 解锁功能清单
 
 | # | 功能 | 原始限制 | 补丁方式 |
 |---|------|----------|----------|
-| 1 | Fast/Speed 模式授权 | `authMethod !== 'chatgpt'` 时隐藏 | 强制返回 `true` |
-| 2 | Fast 模式 Hook 分支 | Hook 提前退出阻止渲染 | `false&&` 禁用条件 |
-| 3 | 模型可用性检查 | relay API 缺少 `additionalSpeedTiers` 字段 | 强制返回 `true` |
-| 4 | Plugins 侧边栏 | 非 chatgpt 模式禁用 | 门控变量 → `0` |
-| 5 | 插件连接器可用性 | API key 模式标记为 `connector-unavailable` | `false&&` 禁用 |
-| 6 | 品牌视觉统一 | API key 用户显示不同品牌 | 强制返回 `false` |
-| 7 | 语音输入/听写 | 仅 chatgpt 模式 | 扩展为 `chatgpt \|\| apikey` |
-| 8 | 用量/计费设置 | 仅 chatgpt 模式 | 扩展为 `chatgpt \|\| apikey` |
-| 9 | i18n 多语言 | Statsig 实验门控，API key 无用户上下文时默认关闭 | 强制启用 `!0` |
+| 1 | 最新模型列表 | API key 无 ChatGPT hidden-model 白名单 | 展示 app-server 已返回的全部模型 |
+| 2 | Fast/Speed UI | `authMethod !== 'chatgpt'` 时隐藏 | 放开服务层级选择器 |
+| 3 | Fast 请求层级 | 发请求前再次限定 `chatgpt` | 将 `apikey` 加入允许列表 |
+| 4 | Plugins | 旧版限制非 ChatGPT；新版已原生支持 API key | 旧版补丁 / 新版自动跳过 |
+| 5 | 语音输入/听写 | 仅 chatgpt 模式 | 扩展为 `chatgpt \|\| apikey` |
+| 6 | 用量/计费设置 | 仅 chatgpt 模式 | 扩展为 `chatgpt \|\| apikey` |
+| 7 | i18n 多语言 | API key 无 Statsig 用户上下文 | 强制启用 |
 
 ## 前置要求
 
@@ -40,7 +38,7 @@ version: 3.0.0
 # macOS / Windows，路径自动检测
 python3 patch.py
 
-# 仅重新打 JS 补丁（Codex 更新后重新适配，跳过 asar/fuses 步骤）
+# 仅检查/调试 JS 补丁（不重新打包 app.asar）
 python3 patch.py --assets /path/to/webview/assets
 
 # 预演，不写入任何文件
@@ -51,48 +49,22 @@ python3 patch.py --dry-run
 
 ## macOS
 
-### 回滚方法
+脚本按顺序检测 `/Applications/ChatGPT.app` 和 `/Applications/Codex.app`，读取 `Info.plist` 的真实可执行文件，并要求 Resources 中存在 Codex 运行时标记。官方 app 不会被修改；补丁写入 `/Applications/ChatGPT-Codex-Patched.app`（旧品牌为 `Codex-Patched.app`）。
 
-```bash
-cd /Applications/Codex.app/Contents/Resources
-rm -rf app
-[ -f app.asar1 ] && mv app.asar1 app.asar
-[ -f app.asar.bak ] && cp app.asar.bak app.asar
-codesign --force --deep --sign - /Applications/Codex.app
-echo "已回滚到原始版本"
-```
-
-### 一键补丁（macOS）
+### 一键补丁
 
 ```bash
 python3 patch.py
 ```
 
-内部执行步骤（供参考）：
+### 回滚
 
 ```bash
-# Step 1: 关闭进程
-pkill -x Codex 2>/dev/null; sleep 1
-
-# Step 2: 提取 asar
-cd /Applications/Codex.app/Contents/Resources
-[ ! -f app.asar.bak ] && cp app.asar app.asar.bak
-npx @electron/asar e ./app.asar app
-mv ./app.asar ./app.asar1
-
-# Step 3: 执行 JS 补丁（patch.py 内部逻辑，见 patch.py 源码）
-
-# Step 4: 禁用 Electron fuses (patch.py 内部调用)
-npx @electron/fuses write --app /Applications/Codex.app OnlyLoadAppFromAsar=off
-npx @electron/fuses write --app /Applications/Codex.app EnableEmbeddedAsarIntegrityValidation=off
-npx @electron/fuses write --app /Applications/Codex.app GrantFileProtocolExtraPrivileges=off
-npx @electron/fuses write --app /Applications/Codex.app EnableCookieEncryption=off
-
-# Step 5: 重新签名 (patch.py 内部调用)
-codesign --force --deep --sign - /Applications/Codex.app
+rm -rf /Applications/ChatGPT-Codex-Patched.app
+# 旧品牌版本：rm -rf /Applications/Codex-Patched.app
 ```
 
-> 以上步骤均由 `python3 patch.py` 自动完成，无需手动执行。
+官方 app 保持原签名，可直接继续使用。
 
 
 ---
@@ -101,10 +73,10 @@ codesign --force --deep --sign - /Applications/Codex.app
 
 ### 回滚方法
 
-**Store 版（MSIX，Codex-Patched 目录）：**
+**Store 版（MSIX，ChatGPT 品牌）：**
 ```powershell
 # 直接删除补丁目录，原 Store 版未动
-Remove-Item -Recurse -Force "$env:LOCALAPPDATA\Programs\Codex-Patched"
+Remove-Item -Recurse -Force "$env:LOCALAPPDATA\Programs\ChatGPT-Codex-Patched"
 ```
 
 **传统安装版：**
@@ -122,97 +94,75 @@ Write-Host "已回滚到原始版本"
 python3 patch.py
 ```
 
-> 自动检测 Microsoft Store 版（MSIX）和传统安装版。
-> Store 版会复制 app 目录到 `%LOCALAPPDATA%\Programs\Codex-Patched`（原版不动），并在桌面创建 `Codex (Patched)` 快捷方式。
+> 自动检测 Microsoft Store 版（MSIX）和传统安装版。MSIX 入口从 `AppxManifest.xml` 读取，并验证 Codex 资源标记。
+> ChatGPT 品牌的 Store 版复制到 `%LOCALAPPDATA%\Programs\ChatGPT-Codex-Patched`（原版不动），桌面快捷方式为 `ChatGPT Codex (Patched)`。
 
 ---
 
-## config.toml 参考配置
+## config.toml
 
-补丁完成后，编辑 `~/.codex/config.toml` 配置你的 API provider：
-
-```toml
-model_provider = "openai"
-base_url = "https://your-api-provider.com/v1"
-experimental_bearer_token = "sk-your-api-key"
-
-[features]
-enable_fast = true
-enable_speed_128k = true
-enable_pro = true
-enable_o3_pro = true
-enable_deep_research = true
-enable_codex_cloud = true
-```
+保留现有 API provider 配置。补丁不写死模型 ID，也不依赖旧版 `features.enable_fast`：模型来自 app-server 的 `model/list`（请求已带 `includeHidden: true`），Fast 选择使用当前版本的 `service_tier`。
 
 ---
 
 ## 版本更新排查指南
 
-Codex 更新后 JS 文件名（hash 后缀）和变量名都可能变化。以下是每个补丁的定位方法：
+ChatGPT Codex 更新后 JS 文件名（hash 后缀）和变量名都可能变化。以下是每个补丁的定位方法：
 
 ### 通用搜索策略
 
 ```bash
-# 用 --assets 参数只重新打补丁，跳过 asar/fuses 步骤
-python3 patch.py --assets /Applications/Codex.app/Contents/Resources/app/webview/assets
+# 用 --assets 参数只检查/打 JS 补丁
+python3 patch.py --assets /Applications/ChatGPT-Codex-Patched.app/Contents/Resources/app/webview/assets
 # Windows (Store 版)
-python3 patch.py --assets "$env:LOCALAPPDATA\Programs\Codex-Patched\resources\app\webview\assets"
+python3 patch.py --assets "$env:LOCALAPPDATA\Programs\ChatGPT-Codex-Patched\resources\app\webview\assets"
 
 # 手动搜索（macOS）
-cd /Applications/Codex.app/Contents/Resources/app/webview/assets
+cd /Applications/ChatGPT-Codex-Patched.app/Contents/Resources/app/webview/assets
 ```
 
-### 1. Fast 模式授权门控
+### 1. 最新模型列表
 
 ```bash
-# 特征关键词: authMethod + chatgpt + return
-grep -rn "authMethod" *.js | grep "chatgpt" | grep "return"
-# 找到包含 return!(xxx?.authMethod!==`chatgpt`||yyy) 的行
-# 替换整个 return 表达式为: return true
+grep -rl "useHiddenModels" *.js
+# 26.707 的目标文件为 model-list-filter-*.js。
+# 原条件：if(useAllowlist?allowed.has(model.model):!model.hidden)
+# 新条件仅对 API key 放开：
+# if(authMethod===`apikey`||(useAllowlist?allowed.has(model.model):!model.hidden))
 ```
 
-### 2. Fast 模式 Hook 早期返回
+### 2. Fast UI / 服务层级门控
 
 ```bash
-# 在同一个文件中，找 if(xxx?.authMethod!==`chatgpt`||yyy){
-grep -o ".{0,30}authMethod!==.chatgpt.{0,20}" <文件名>
-# 在 if 条件前加 false&& 使其永远不进入
+grep -rl "isServiceTierAllowed" *.js
+# use-service-tier-settings-*.js 中：
+# allowed=auth?.authMethod===`chatgpt`,method=auth?.authMethod??null
+# 将 allowed 改为：
+# auth?.authMethod===`apikey`||auth?.authMethod===`chatgpt`
 ```
 
-### 3. 模型可用性检查
+### 3. Fast 实际请求门控
 
 ```bash
-# 在同一个文件中，找 xxx?.models.some(YYY)??!1
-grep -o ".{0,20}models\.some.{0,30}" <文件名>
-# 替换整个表达式为: true
+grep -rl "Failed to read service tier for request" *.js
+# read-service-tier-for-request-*.js 中：
+# if(method!==`chatgpt`)return!1
+# 改为：if(method!==`chatgpt`&&method!==`apikey`)return!1
 ```
 
-### 4. 插件侧边栏
+### 4. Plugins
 
 ```bash
-grep -rl "pluginsDisabledTooltip" *.js
-# 找到 X?(0,$.jsx)(组件,{tooltipContent... 中的门控变量 X
-# 将 X? 改为 0?
+grep -rl "useHiddenOpenAICuratedMarketplaces" *.js
+# 26.707 的 use-plugins-*.js 已包含：
+# return method!==`chatgpt`&&method!==`apikey`&&...
+# 这表示 API key 已原生允许，脚本应报告 SKIP，而不是误改
+# plugin detail 页中仅用于展示原因的 connector-unavailable 文本。
 ```
 
-### 5. 插件连接器
+旧版若仍有 `check-plugin-availability-*.js` 中的赋值门控，脚本继续使用 `false&&` 兼容补丁。该 UI 补丁不会伪造 `/aip/connectors` 所需的 ChatGPT 会话身份，因此不要把新版 ChatGPT 会话型连接器描述为 API key 原生可用。
 
-```bash
-grep -rl "connector-unavailable" *.js
-# 找到 (变量=`connector-unavailable`)
-# 前面加 false&& 使其永远不执行
-```
-
-### 6. 品牌视觉
-
-```bash
-grep -rn "return e!==.chatgpt." *.js
-# 找到 function e(e){return e!==`chatgpt`}
-# 改为 function e(e){return false}
-```
-
-### 7. 语音输入
+### 5. 语音输入
 
 ```bash
 grep -rn "authMethod===.chatgpt." *.js | grep -v "!=="
@@ -220,7 +170,7 @@ grep -rn "authMethod===.chatgpt." *.js | grep -v "!=="
 # 扩展为 xxx&&(yyy.authMethod===`chatgpt`||yyy.authMethod===`apikey`)
 ```
 
-### 8. 用量设置
+### 6. 用量设置
 
 ```bash
 grep -rn "let.*===.chatgpt." *.js
@@ -228,7 +178,7 @@ grep -rn "let.*===.chatgpt." *.js
 # 扩展为 let r=e===`chatgpt`||e===`apikey`
 ```
 
-### 9. i18n 多语言
+### 7. i18n 多语言
 
 ```bash
 grep -rn "enable_i18n" *.js
@@ -241,11 +191,11 @@ grep -rn "enable_i18n" *.js
 
 | 操作 | 原因 | 位置 |
 |------|------|------|
-| `OnlyLoadAppFromAsar=off` | 让 Electron 读 `app/` 文件夹而非 `app.asar` | Electron fuse |
-| `EnableEmbeddedAsarIntegrityValidation=off` | 跳过 asar 完整性 SHA 校验 | Electron fuse |
-| `GrantFileProtocolExtraPrivileges=off` | 禁用 file 协议限制 | Electron fuse |
-| `EnableCookieEncryption=off` | 禁用 cookie 加密检查 | Electron fuse |
-| `mv app.asar app.asar1` | Electron 在 asar 不存在时自动降级到 `app/` 文件夹 | Resources 目录 |
-| `codesign --force --deep --sign -` | macOS 拒绝启动未签名的修改应用 | 最终步骤 (仅 macOS) |
+| 从 manifest/plist 读取入口 | ChatGPT 显示名、包身份和可执行文件名不再一致 | 安装发现 |
+| 提取后重新打包 `app.asar` | Owl 运行时不会回退加载松散的 `app/` 目录 | Resources 目录 |
+| 保留 `.node` / 原生模块 sidecar | Electron 必须从磁盘加载原生扩展 | `app.asar.unpacked` |
+| `codesign --force --deep --sign -` | macOS 拒绝启动签名失效的修改副本 | 最终步骤 (仅 macOS) |
+| hidden-model 过滤绕过 | API key 没有 ChatGPT Statsig 模型白名单 | `model-list-filter-*` |
+| 请求级服务层级放行 | 仅显示 Fast 选项不足以改变实际请求 | `read-service-tier-for-request-*` |
 | Statsig 实验绕过 | API key 模式无 Statsig 用户上下文，i18n/特性实验默认关闭 | webview JS |
 | `authMethod` 门控绕过 | 多处功能检查 `=== 'chatgpt'`，API key 模式被排除 | webview JS |
