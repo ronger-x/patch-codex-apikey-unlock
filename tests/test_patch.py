@@ -9,7 +9,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 PATCH_SCRIPT = REPO_ROOT / "patch.py"
 
 
-class ChatGptCodexPatchTests(unittest.TestCase):
+class ChatGPTCodexPatchTests(unittest.TestCase):
     def test_26707_model_and_fast_gates_are_patched_idempotently(self):
         with tempfile.TemporaryDirectory() as tmp:
             assets = Path(tmp)
@@ -36,15 +36,20 @@ class ChatGptCodexPatchTests(unittest.TestCase):
                 "})}",
                 encoding="utf-8",
             )
-            native_plugins.write_text(
+            native_plugin_source = (
                 "function supported(method){return "
-                "method!==`chatgpt`&&method!==`apikey`&&method!==`amazonBedrock`}",
-                encoding="utf-8",
+                "method!==`chatgpt`&&method!==`apikey`&&method!==`amazonBedrock`}"
             )
+            native_plugins.write_text(native_plugin_source, encoding="utf-8")
 
             first = self.run_patch(assets)
             self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
             self.assertNotIn("[FAIL]", first.stdout)
+            self.assertIn(
+                "[SKIP] 品牌视觉/插件市场统一 (新版已原生支持 API key)",
+                first.stdout,
+            )
+            self.assertEqual(native_plugin_source, native_plugins.read_text("utf-8"))
             self.assertIn(
                 "gate=auth?.authMethod===`apikey`||"
                 "auth?.authMethod===`chatgpt`",
@@ -72,6 +77,47 @@ class ChatGptCodexPatchTests(unittest.TestCase):
                 contents_after_first_run,
                 {path.name: path.read_text("utf-8") for path in assets.glob("*.js")},
             )
+
+            return_variants = (
+                "function supported(method){return(method!==`chatgpt`&&"
+                "method!==`apikey`&&method!==`amazonBedrock`)}",
+                "function supported(method){return   method!==`chatgpt`&&"
+                "method!==`apikey`&&method!==`amazonBedrock`}",
+                "function supported(method){return   (method!==`chatgpt`&&"
+                "method!==`apikey`&&method!==`amazonBedrock`)}",
+                "function supported ( method ) { return ( method !== `chatgpt` && "
+                "method !== `apikey` && method !== `amazonBedrock` ) }",
+            )
+            for source in return_variants:
+                with self.subTest(source=source):
+                    native_plugins.write_text(source, encoding="utf-8")
+                    result = self.run_patch(assets)
+                    self.assertEqual(
+                        result.returncode, 0, result.stdout + result.stderr
+                    )
+                    self.assertNotIn("[FAIL]", result.stdout)
+                    self.assertEqual(source, native_plugins.read_text("utf-8"))
+                    self.assertIn(
+                        "[SKIP] 旧版插件连接器 UI 门控 "
+                        "(新版已移除该旧补丁点)",
+                        result.stdout,
+                    )
+                    self.assertIn(
+                        "[SKIP] 品牌视觉/插件市场统一 "
+                        "(新版已原生支持 API key)",
+                        result.stdout,
+                    )
+                    self.assertNotIn("[OK] 品牌视觉/插件统一", result.stdout)
+
+            asi_source = (
+                "function supported(method){return\n"
+                "method!==`chatgpt`&&method!==`apikey`}"
+            )
+            native_plugins.write_text(asi_source, encoding="utf-8")
+            asi_result = self.run_patch(assets)
+            self.assertNotEqual(asi_result.returncode, 0)
+            self.assertNotIn("新版已原生支持 API key", asi_result.stdout)
+            self.assertEqual(asi_source, native_plugins.read_text("utf-8"))
 
     @staticmethod
     def run_patch(assets):

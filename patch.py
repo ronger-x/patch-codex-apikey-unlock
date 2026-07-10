@@ -403,13 +403,18 @@ def _single_patch_target(files, name, required=True):
 
 
 def _native_apikey_plugins_file(assets):
-    pattern = (
-        r'function ([a-zA-Z_$]+)\(([a-zA-Z_$]+)\)\{return '
-        r'\2!==`chatgpt`&&\2!==`apikey`'
+    identifier = r'[a-zA-Z_$][a-zA-Z0-9_$]*'
+    pattern = re.compile(
+        rf'function[ \t]+{identifier}[ \t]*\([ \t]*'
+        rf'(?P<arg>{identifier})[ \t]*\)[ \t]*\{{[ \t]*'
+        r'return(?:[ \t]+(?:\([ \t]*)?|\([ \t]*)'
+        r'(?P=arg)[ \t]*!==[ \t]*`chatgpt`[ \t]*&&[ \t]*'
+        r'(?P=arg)[ \t]*!==[ \t]*`apikey`'
+        r'(?=[ \t]*(?:&&|\)|;|\}))'
     )
     for fp in _find(assets, "use-plugins-*.js"):
         with open(fp, encoding="utf-8") as fh:
-            if re.search(pattern, fh.read()):
+            if pattern.search(fh.read()):
                 return fp
     return None
 
