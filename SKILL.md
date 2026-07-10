@@ -2,9 +2,9 @@
 name: patch-codex-apikey-unlock
 description: |
   Patch ChatGPT Codex (macOS/Windows) - API Key 模式功能解锁。
-  兼容 ChatGPT/Codex 双品牌名称，显示 app-server 返回的最新隐藏模型，
-  并解除 Fast/Speed 模式的 UI 与请求级认证门控。
-version: 4.0.0
+  兼容 ChatGPT/Codex 双品牌名称，显示 app-server 返回的最新隐藏模型和
+  完整推理强度，并解除 Fast/Speed 模式的 UI 与请求级认证门控。
+version: 4.1.0
 ---
 
 # Patch ChatGPT Codex - API Key 模式功能解锁
@@ -20,12 +20,13 @@ version: 4.0.0
 | # | 功能 | 原始限制 | 补丁方式 |
 |---|------|----------|----------|
 | 1 | 最新模型列表 | API key 无 ChatGPT hidden-model 白名单 | 展示 app-server 已返回的全部模型 |
-| 2 | Fast/Speed UI | `authMethod !== 'chatgpt'` 时隐藏 | 放开服务层级选择器 |
-| 3 | Fast 请求层级 | 发请求前再次限定 `chatgpt` | 将 `apikey` 加入允许列表 |
-| 4 | Plugins | 旧版限制非 ChatGPT；新版已原生支持 API key | 旧版补丁 / 新版自动跳过 |
-| 5 | 语音输入/听写 | 仅 chatgpt 模式 | 扩展为 `chatgpt \|\| apikey` |
-| 6 | 用量/计费设置 | 仅 chatgpt 模式 | 扩展为 `chatgpt \|\| apikey` |
-| 7 | i18n 多语言 | API key 无 Statsig 用户上下文 | 强制启用 |
+| 2 | 完整推理强度 | Ultra 实验门和 enabled 集合隐藏部分档位 | API key 使用模型声明的全部合法档位 |
+| 3 | Fast/Speed UI | `authMethod !== 'chatgpt'` 时隐藏 | 放开服务层级选择器 |
+| 4 | Fast 请求层级 | 发请求前再次限定 `chatgpt` | 将 `apikey` 加入允许列表 |
+| 5 | Plugins | 旧版限制非 ChatGPT；新版已原生支持 API key | 旧版补丁 / 新版自动跳过 |
+| 6 | 语音输入/听写 | 仅 chatgpt 模式 | 扩展为 `chatgpt \|\| apikey` |
+| 7 | 用量/计费设置 | 仅 chatgpt 模式 | 扩展为 `chatgpt \|\| apikey` |
+| 8 | i18n 多语言 | API key 无 Statsig 用户上下文 | 强制启用 |
 
 ## 前置要求
 
@@ -131,7 +132,22 @@ grep -rl "useHiddenModels" *.js
 # if(authMethod===`apikey`||(useAllowlist?allowed.has(model.model):!model.hidden))
 ```
 
-### 2. Fast UI / 服务层级门控
+### 2. 完整推理强度
+
+```bash
+grep -rl "enabledReasoningEfforts" *.js
+# 同一 model-list-filter-*.js 中有两层过滤：
+# 1. includeUltraReasoningEffort 为 false 时移除 ultra
+# 2. enabledReasoningEfforts.has(effort) 隐藏未启用档位
+# API key 模式绕过这两层，但继续保留合法枚举校验；
+# 不硬编码档位，只展示每个模型的 supportedReasoningEfforts。
+```
+
+API key 模式的完整列表显示在 Advanced/Effort 菜单，包括模型声明支持的
+`none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`、`ultra`。
+简化 Power 滑杆使用官方固定组合，不在此补丁中修改。
+
+### 3. Fast UI / 服务层级门控
 
 ```bash
 grep -rl "isServiceTierAllowed" *.js
@@ -141,7 +157,7 @@ grep -rl "isServiceTierAllowed" *.js
 # auth?.authMethod===`apikey`||auth?.authMethod===`chatgpt`
 ```
 
-### 3. Fast 实际请求门控
+### 4. Fast 实际请求门控
 
 ```bash
 grep -rl "Failed to read service tier for request" *.js
@@ -150,7 +166,7 @@ grep -rl "Failed to read service tier for request" *.js
 # 改为：if(method!==`chatgpt`&&method!==`apikey`)return!1
 ```
 
-### 4. Plugins
+### 5. Plugins
 
 ```bash
 grep -rl "useHiddenOpenAICuratedMarketplaces" *.js
@@ -162,7 +178,7 @@ grep -rl "useHiddenOpenAICuratedMarketplaces" *.js
 
 旧版若仍有 `check-plugin-availability-*.js` 中的赋值门控，脚本继续使用 `false&&` 兼容补丁。该 UI 补丁不会伪造 `/aip/connectors` 所需的 ChatGPT 会话身份，因此不要把新版 ChatGPT 会话型连接器描述为 API key 原生可用。
 
-### 5. 语音输入
+### 6. 语音输入
 
 ```bash
 grep -rn "authMethod===.chatgpt." *.js | grep -v "!=="
@@ -170,7 +186,7 @@ grep -rn "authMethod===.chatgpt." *.js | grep -v "!=="
 # 扩展为 xxx&&(yyy.authMethod===`chatgpt`||yyy.authMethod===`apikey`)
 ```
 
-### 6. 用量设置
+### 7. 用量设置
 
 ```bash
 grep -rn "let.*===.chatgpt." *.js
@@ -178,7 +194,7 @@ grep -rn "let.*===.chatgpt." *.js
 # 扩展为 let r=e===`chatgpt`||e===`apikey`
 ```
 
-### 7. i18n 多语言
+### 8. i18n 多语言
 
 ```bash
 grep -rn "enable_i18n" *.js
@@ -196,6 +212,7 @@ grep -rn "enable_i18n" *.js
 | 保留 `.node` / 原生模块 sidecar | Electron 必须从磁盘加载原生扩展 | `app.asar.unpacked` |
 | `codesign --force --deep --sign -` | macOS 拒绝启动签名失效的修改副本 | 最终步骤 (仅 macOS) |
 | hidden-model 过滤绕过 | API key 没有 ChatGPT Statsig 模型白名单 | `model-list-filter-*` |
+| reasoning-effort 过滤绕过 | API key 无 Ultra 实验上下文且默认 enabled 集合不完整 | `model-list-filter-*` |
 | 请求级服务层级放行 | 仅显示 Fast 选项不足以改变实际请求 | `read-service-tier-for-request-*` |
 | Statsig 实验绕过 | API key 模式无 Statsig 用户上下文，i18n/特性实验默认关闭 | webview JS |
 | `authMethod` 门控绕过 | 多处功能检查 `=== 'chatgpt'`，API key 模式被排除 | webview JS |
