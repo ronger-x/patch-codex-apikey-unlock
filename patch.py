@@ -478,7 +478,7 @@ def apply_model_filter_patch(fp):
 
 
 def _js_block_end(content, opening_brace):
-    """Return the offset after a JS block while ignoring braces in literals."""
+    """Return the offset after a JS block, ignoring quoted strings and comments."""
     depth = 0
     quote = None
     escaped = False

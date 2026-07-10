@@ -1,4 +1,5 @@
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -109,8 +110,11 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
                 model_filter.read_text("utf-8"),
             )
 
+            node = shutil.which("node")
+            if node is None:
+                self.fail("Node.js is required for reasoning-effort semantic tests")
             semantic_result = subprocess.run(
-                ["node", str(model_filter), "--verify"],
+                [node, str(model_filter), "--verify"],
                 cwd=REPO_ROOT,
                 capture_output=True,
                 text=True,
