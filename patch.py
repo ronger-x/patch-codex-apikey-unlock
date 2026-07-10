@@ -158,7 +158,7 @@ def step_kill_codex(exe_path, macos_app_paths=()):
                 os.path.join(os.path.abspath(app_path), "Contents") + os.sep)
             run_cmd(["pkill", "-f", contents_pattern])
     elif IS_WINDOWS:
-        run_cmd(["taskkill", "/F", "/IM", process_name])
+        run_cmd(["taskkill", "/F", "/IM", process_name], capture=True)
     time.sleep(1)
 
 
@@ -228,6 +228,89 @@ def _die(msg):
     sys.exit(1)
 
 
+def _kill_windows_processes_under(root):
+    """Force-stop processes whose executable is inside root."""
+    ps = (
+        "$ErrorActionPreference='Stop'\n"
+        "$trimChars=[char[]]'\\/'\n"
+        "$root=[IO.Path]::GetFullPath($env:CODEX_PATCH_PROCESS_ROOT)"
+        ".TrimEnd($trimChars)\n"
+        "$volumeRoot=[IO.Path]::GetPathRoot($root).TrimEnd($trimChars)\n"
+        "if([string]::IsNullOrWhiteSpace($root) -or $root -eq $volumeRoot){"
+        "throw 'Refusing to scan a filesystem root'}\n"
+        "$prefix=$root+[IO.Path]::DirectorySeparatorChar\n"
+        "for($attempt=0;$attempt -lt 4;$attempt++){\n"
+        "  $processes=@(Get-CimInstance -ClassName Win32_Process | "
+        "Where-Object {$_.ExecutablePath -and $_.ExecutablePath.StartsWith("
+        "$prefix,[StringComparison]::OrdinalIgnoreCase)})\n"
+        "  if($processes.Count -eq 0){exit 0}\n"
+        "  if($attempt -eq 3){throw 'Processes are still running'}\n"
+        "  foreach($process in $processes){\n"
+        "    $targetId=[int]$process.ProcessId\n"
+        "    $current=Get-CimInstance -ClassName Win32_Process "
+        "-Filter (\"ProcessId = $targetId\") -ErrorAction SilentlyContinue\n"
+        "    if($null -ne $current -and $current.ExecutablePath -and "
+        "$current.ExecutablePath.StartsWith("
+        "$prefix,[StringComparison]::OrdinalIgnoreCase)){\n"
+        "      Stop-Process -Id $targetId -Force -ErrorAction SilentlyContinue\n"
+        "    }\n"
+        "  }\n"
+        "  Start-Sleep -Milliseconds 200\n"
+        "}\n"
+    )
+    powershell = os.path.join(
+        os.environ.get("SystemRoot", r"C:\Windows"),
+        "System32", "WindowsPowerShell", "v1.0", "powershell.exe",
+    )
+    env = os.environ.copy()
+    env["CODEX_PATCH_PROCESS_ROOT"] = os.path.abspath(root)
+    # Windows PowerShell 5.1 reads `-Command -` interactively and does not
+    # execute a multi-line compound statement at EOF. A complete single-line
+    # statement keeps stdin/env transport safe without shell quoting.
+    ps = ps.replace("\n", ";")
+    try:
+        result = subprocess.run(
+            [
+                powershell, "-NoLogo", "-NoProfile", "-NonInteractive",
+                "-Command", "-",
+            ],
+            input=ps,
+            env=env,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            shell=False,
+        )
+    except OSError:
+        return False
+    return result.returncode == 0
+
+
+def _rmtree_clear_readonly(function, path, exc_info):
+    """shutil.rmtree callback for read-only files copied from WindowsApps."""
+    error = exc_info[1]
+    if not isinstance(error, PermissionError):
+        raise error.with_traceback(exc_info[2])
+    os.chmod(path, stat.S_IWRITE)
+    function(path)
+
+
+def _remove_windows_store_copy(path, attempts=5, retry_delay=0.5):
+    """Stop runtimes from an old Store copy and remove it with short retries."""
+    _kill_windows_processes_under(path)
+    for attempt in range(attempts):
+        try:
+            shutil.rmtree(path, onerror=_rmtree_clear_readonly)
+            return
+        except FileNotFoundError:
+            return
+        except OSError:
+            if attempt == attempts - 1:
+                raise
+            _kill_windows_processes_under(path)
+            time.sleep(retry_delay * (attempt + 1))
+
+
 # ================================================================
 # 步骤 3 (仅 Store 版): 复制到可写目录
 # ================================================================
@@ -261,7 +344,16 @@ def step_copy_store(store_root):
         return patch_root, resources, exe
 
     if os.path.exists(patch_root):
-        shutil.rmtree(patch_root)
+        print("    正在关闭旧补丁副本的后台进程并清理目录...")
+        try:
+            _remove_windows_store_copy(patch_root)
+        except OSError as exc:
+            _die(
+                f"无法清理旧补丁目录: {patch_root}\n"
+                "请确认从该目录启动的 ChatGPT/Codex 及 Computer Use 已关闭；"
+                "若它以管理员身份运行，请以管理员身份重新运行本脚本。"
+                f"\n原始错误: {exc}"
+            )
     os.makedirs(patch_root, exist_ok=True)
 
     # /COPY:DAT 只复制数据/属性/时间戳，跳过 EFS 加密属性（WindowsApps 目录限制）

@@ -530,6 +530,140 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
             self.assertEqual(drifted, identity_file.read_text("utf-8"))
             self.assertEqual(1, len(patch_module.results["failed"]))
 
+    def test_windows_shutdown_hides_missing_main_and_only_scans_patched_root(self):
+        with loaded_patch_module() as patch_module:
+            patch_module.IS_MACOS = False
+            patch_module.IS_WINDOWS = True
+            patch_module.DRY_RUN = False
+
+            with (
+                mock.patch.object(patch_module, "run_cmd", return_value=(0, ""))
+                as run_cmd,
+                mock.patch.object(patch_module.time, "sleep"),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                patch_module.step_kill_codex(str(Path("fake") / "Codex.exe"))
+
+            run_cmd.assert_called_once_with(
+                ["taskkill", "/F", "/IM", "Codex.exe"], capture=True
+            )
+
+            completed = subprocess.CompletedProcess([], 0, "", "")
+            with mock.patch.object(
+                patch_module.subprocess, "run", return_value=completed
+            ) as run:
+                patch_module._kill_windows_processes_under(
+                    r"C:\Users\O'Brien\AppData\Local\Programs\Codex-Patched"
+                )
+
+            command = run.call_args.args[0]
+            options = run.call_args.kwargs
+            script = options["input"]
+            self.assertTrue(command[0].lower().endswith("powershell.exe"))
+            self.assertEqual(command[-2:], ["-Command", "-"])
+            self.assertIn("ExecutablePath.StartsWith", script)
+            self.assertIn("OrdinalIgnoreCase", script)
+            self.assertIn("Stop-Process -Id $targetId", script)
+            self.assertNotIn("O'Brien", script)
+            self.assertNotIn("node.exe", script)
+            self.assertNotIn("\n", script)
+            self.assertTrue(options["shell"] is False)
+            self.assertTrue(
+                options["env"]["CODEX_PATCH_PROCESS_ROOT"].endswith(
+                    "Codex-Patched"
+                )
+            )
+
+    def test_windows_store_cleanup_retries_locked_runtime(self):
+        with loaded_patch_module() as patch_module:
+            locked = PermissionError(
+                13, "Access is denied", r"C:\Codex-Patched\resources\cua_node\node.exe"
+            )
+            with (
+                mock.patch.object(
+                    patch_module.shutil, "rmtree", side_effect=[locked, None]
+                ) as rmtree,
+                mock.patch.object(
+                    patch_module, "_kill_windows_processes_under"
+                ) as kill_processes,
+                mock.patch.object(patch_module.time, "sleep") as sleep,
+            ):
+                patch_module._remove_windows_store_copy(r"C:\Codex-Patched")
+
+            self.assertEqual(2, rmtree.call_count)
+            self.assertEqual(2, kill_processes.call_count)
+            sleep.assert_called_once_with(0.5)
+            for call in rmtree.call_args_list:
+                self.assertIs(call.kwargs["onerror"], patch_module._rmtree_clear_readonly)
+
+            retry_delete = mock.Mock()
+            readonly_error = PermissionError(13, "Read-only", r"C:\Codex-Patched\file")
+            with mock.patch.object(patch_module.os, "chmod") as chmod:
+                patch_module._rmtree_clear_readonly(
+                    retry_delete,
+                    r"C:\Codex-Patched\file",
+                    (PermissionError, readonly_error, None),
+                )
+            chmod.assert_called_once_with(
+                r"C:\Codex-Patched\file", patch_module.stat.S_IWRITE
+            )
+            retry_delete.assert_called_once_with(r"C:\Codex-Patched\file")
+
+    def test_rmtree_callback_preserves_non_permission_traceback(self):
+        class TrackedOSError(OSError):
+            restored_traceback = None
+
+            def with_traceback(self, traceback):
+                self.restored_traceback = traceback
+                return super().with_traceback(traceback)
+
+        with loaded_patch_module() as patch_module:
+            try:
+                raise TrackedOSError("unexpected cleanup failure")
+            except TrackedOSError:
+                exc_info = sys.exc_info()
+
+            try:
+                patch_module._rmtree_clear_readonly(
+                    mock.Mock(), r"C:\Codex-Patched\file", exc_info
+                )
+            except TrackedOSError as raised:
+                self.assertIs(raised, exc_info[1])
+            else:
+                self.fail("non-PermissionError was not re-raised")
+
+            self.assertIs(exc_info[1].restored_traceback, exc_info[2])
+
+    def test_windows_store_copy_stops_when_old_copy_cannot_be_removed(self):
+        with loaded_patch_module() as patch_module, tempfile.TemporaryDirectory() as tmp:
+            patch_module.DRY_RUN = False
+            store_root = str(Path(tmp) / "WindowsApps" / "OpenAI.Codex")
+            source_root = str(Path(store_root) / "app")
+            source_exe = str(Path(source_root) / "Codex.exe")
+            patch_root = Path(tmp) / "Programs" / "Codex-Patched"
+            patch_root.mkdir(parents=True)
+            locked = PermissionError(13, "Access is denied", str(patch_root / "node.exe"))
+
+            with (
+                mock.patch.dict(patch_module.os.environ, {"LOCALAPPDATA": tmp}),
+                mock.patch.object(
+                    patch_module,
+                    "_store_app_details",
+                    return_value=(source_root, str(Path(source_root) / "resources"), source_exe),
+                ),
+                mock.patch.object(
+                    patch_module, "_remove_windows_store_copy", side_effect=locked
+                ),
+                mock.patch.object(patch_module, "run_cmd") as run_cmd,
+                contextlib.redirect_stdout(io.StringIO()) as output,
+                self.assertRaises(SystemExit),
+            ):
+                patch_module.step_copy_store(store_root)
+
+            run_cmd.assert_not_called()
+            self.assertIn("无法清理旧补丁目录", output.getvalue())
+            self.assertIn("Computer Use", output.getvalue())
+
     def test_current_desktop_feature_marker_drift_fails_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
             assets = Path(tmp)
