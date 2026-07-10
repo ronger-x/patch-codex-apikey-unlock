@@ -477,6 +477,202 @@ def apply_model_filter_patch(fp):
     print("    [OK]   隐藏模型列表解锁 (regex)")
 
 
+def _js_block_end(content, opening_brace):
+    """Return the offset after a JS block while ignoring braces in literals."""
+    depth = 0
+    quote = None
+    escaped = False
+    line_comment = False
+    block_comment = False
+    i = opening_brace
+    while i < len(content):
+        char = content[i]
+        next_char = content[i + 1] if i + 1 < len(content) else ""
+        if line_comment:
+            if char in "\r\n":
+                line_comment = False
+        elif block_comment:
+            if char == "*" and next_char == "/":
+                block_comment = False
+                i += 1
+        elif quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+        elif char == "/" and next_char == "/":
+            line_comment = True
+            i += 1
+        elif char == "/" and next_char == "*":
+            block_comment = True
+            i += 1
+        elif char in "'\"`":
+            quote = char
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return None
+
+
+def apply_reasoning_effort_filter_patch(fp, validate_only=False):
+    with open(fp, encoding="utf-8") as fh:
+        content = fh.read()
+    bn = os.path.basename(fp)
+    patch_name = f"{bn}: 推理强度列表解锁"
+    identifier = r'[a-zA-Z_$][a-zA-Z0-9_$]*'
+
+    signature_pattern = re.compile(
+        rf'function[ \t]+{identifier}[ \t]*\([ \t]*\{{'
+        rf'(?P<fields>[^}}]*)\}}[ \t]*\)[ \t]*\{{'
+    )
+
+    def field_alias(fields, field):
+        match = re.search(
+            rf'(?:^|,)[ \t]*{re.escape(field)}'
+            rf'(?::(?P<alias>{identifier}))?[ \t]*(?=,|$)',
+            fields,
+        )
+        return (match.group("alias") or field) if match is not None else None
+
+    target_signatures = []
+    required_fields = (
+        "authMethod",
+        "enabledReasoningEfforts",
+        "includeUltraReasoningEffort",
+    )
+    for match in signature_pattern.finditer(content):
+        aliases = {
+            field: field_alias(match.group("fields"), field)
+            for field in required_fields
+        }
+        if all(aliases.values()):
+            target_signatures.append((match, aliases))
+    if len(target_signatures) != 1:
+        mark_missing(patch_name, "目标结构不匹配")
+        return False
+
+    signature_match, aliases = target_signatures[0]
+    scope_start = signature_match.start()
+    scope_end = _js_block_end(content, signature_match.end() - 1)
+    if scope_end is None:
+        mark_missing(patch_name, "目标结构不匹配")
+        return False
+    scope = content[scope_start:scope_end]
+    auth = aliases["authMethod"]
+    enabled = aliases["enabledReasoningEfforts"]
+    ultra_gate = aliases["includeUltraReasoningEffort"]
+
+    ultra_original = re.compile(
+        rf'(?P<target>{identifier})={re.escape(ultra_gate)}\?'
+        rf'(?P<model>{identifier})\.supportedReasoningEfforts:'
+        r'(?P=model)\.supportedReasoningEfforts\.filter\(\(\{'
+        rf'reasoningEffort:(?P<effort>{identifier})\}}\)=>'
+        r'(?P=effort)!==`ultra`\)'
+    )
+    ultra_patched = re.compile(
+        rf'(?P<target>{identifier})=\({re.escape(auth)}===`apikey`\|\|'
+        rf'{re.escape(ultra_gate)}\)\?(?P<model>{identifier})\.'
+        r'supportedReasoningEfforts:(?P=model)\.supportedReasoningEfforts\.'
+        r'filter\(\(\{reasoningEffort:(?P<effort>'
+        rf'{identifier})\}}\)=>(?P=effort)!==`ultra`\)'
+    )
+    enabled_original = re.compile(
+        rf'(?P<prefix>\({re.escape(auth)}===`copilot`\?\[.*?\]:'
+        rf'(?P<efforts>{identifier})\))\.filter\(\(\{{'
+        r'reasoningEffort:(?P<effort>'
+        rf'{identifier})\}}\)=>(?P<validator>{identifier})\('
+        rf'(?P=effort)\)&&{re.escape(enabled)}\.has\((?P=effort)\)\)'
+    )
+    enabled_patched = re.compile(
+        rf'(?P<prefix>\({re.escape(auth)}===`copilot`\?\[.*?\]:'
+        rf'(?P<efforts>{identifier})\))\.filter\(\(\{{'
+        rf'reasoningEffort:(?P<effort>{identifier})\}}\)=>'
+        rf'(?P<validator>{identifier})\((?P=effort)\)&&\('
+        rf'{re.escape(auth)}===`apikey`\|\|{re.escape(enabled)}\.'
+        r'has\((?P=effort)\)\)\)'
+    )
+
+    ultra_original_matches = list(ultra_original.finditer(scope))
+    ultra_patched_matches = list(ultra_patched.finditer(scope))
+    enabled_original_matches = list(enabled_original.finditer(scope))
+    enabled_patched_matches = list(enabled_patched.finditer(scope))
+    if (len(ultra_original_matches) + len(ultra_patched_matches) != 1 or
+            len(enabled_original_matches) + len(enabled_patched_matches) != 1):
+        mark_missing(patch_name, "目标结构不匹配")
+        return False
+
+    ultra_match = (ultra_original_matches or ultra_patched_matches)[0]
+    enabled_match = (enabled_original_matches or enabled_patched_matches)[0]
+    if enabled_match.group("efforts") != ultra_match.group("target"):
+        mark_missing(patch_name, "目标结构不匹配")
+        return False
+    if enabled_patched_matches:
+        shadowed_names = {
+            auth,
+            enabled,
+            enabled_match.group("validator"),
+        }
+        if enabled_match.group("effort") in shadowed_names:
+            mark_missing(patch_name, "目标结构不匹配")
+            return False
+    if validate_only:
+        return True
+    if ultra_patched_matches and enabled_patched_matches:
+        results["skipped"].append(patch_name)
+        print("    [SKIP] 推理强度列表解锁")
+        return True
+
+    edits = []
+    if ultra_original_matches:
+        model = ultra_match.group("model")
+        effort = ultra_match.group("effort")
+        replacement = (
+            f"{ultra_match.group('target')}=({auth}===`apikey`||{ultra_gate})?"
+            f"{model}.supportedReasoningEfforts:"
+            f"{model}.supportedReasoningEfforts.filter("
+            f"({{reasoningEffort:{effort}}})=>{effort}!==`ultra`)"
+        )
+        edits.append((ultra_match.start(), ultra_match.end(), replacement))
+    if enabled_original_matches:
+        used_identifiers = set(re.findall(identifier, scope))
+        patched_effort = "__codexReasoningEffort"
+        suffix = 2
+        while patched_effort in used_identifiers:
+            patched_effort = f"__codexReasoningEffort{suffix}"
+            suffix += 1
+        replacement = (
+            f"{enabled_match.group('prefix')}.filter("
+            f"({{reasoningEffort:{patched_effort}}})=>"
+            f"{enabled_match.group('validator')}({patched_effort})&&"
+            f"({auth}===`apikey`||{enabled}.has({patched_effort})))"
+        )
+        edits.append((enabled_match.start(), enabled_match.end(), replacement))
+
+    patched_scope = scope
+    for start, end, replacement in sorted(edits, reverse=True):
+        patched_scope = patched_scope[:start] + replacement + patched_scope[end:]
+    if (ultra_original.search(patched_scope) is not None or
+            enabled_original.search(patched_scope) is not None or
+            len(list(ultra_patched.finditer(patched_scope))) != 1 or
+            len(list(enabled_patched.finditer(patched_scope))) != 1):
+        mark_missing(patch_name, "补丁后校验失败")
+        return False
+
+    patched_content = content[:scope_start] + patched_scope + content[scope_end:]
+    if not DRY_RUN:
+        with open(fp, "w", encoding="utf-8") as fh:
+            fh.write(patched_content)
+    results["applied"].append(f"{patch_name} (regex)")
+    print("    [OK]   推理强度列表解锁 (regex)")
+    return True
+
+
 def step_patch_js(assets):
     print(f"[5] 应用 JS 补丁...")
     print(f"    {assets}\n")
@@ -534,11 +730,11 @@ def step_patch_js(assets):
             lambda m: f"if({m.group(1)}!==`chatgpt`&&{m.group(1)}!==`apikey`)return!1;",
             skip_regex=r'if\(([a-zA-Z_$]+)!==`chatgpt`&&\1!==`apikey`\)return!1;')
 
-    # ── 模块 2: 最新模型 / 隐藏模型列表 (1 补丁) ────────────────
+    # ── 模块 2: 最新模型 / 推理强度列表 (2 补丁) ────────────────
     # API key 模式没有 ChatGPT Statsig 的 hidden-model 白名单。
     # list-models-for-host 已请求 includeHidden=true，这里放开默认分支即可展示
     # 后端实际返回的新模型，同时保留 ChatGPT 账号模式的显式白名单逻辑。
-    print("\n  [模块 2] 最新模型 / 隐藏模型列表")
+    print("\n  [模块 2] 最新模型 / 推理强度列表")
     model_filter_files = _find(assets, "model-list-filter-*.js")
     if not model_filter_files:
         for f in glob.glob(os.path.join(assets, "*.js")):
@@ -551,7 +747,23 @@ def step_patch_js(assets):
         model_filter_fp = _single_patch_target(
             model_filter_files, "隐藏模型列表解锁")
         if model_filter_fp is not None:
-            apply_model_filter_patch(model_filter_fp)
+            with open(model_filter_fp, encoding="utf-8") as fh:
+                model_filter_content = fh.read()
+            has_reasoning_filters = (
+                "enabledReasoningEfforts" in model_filter_content or
+                "includeUltraReasoningEffort" in model_filter_content
+            )
+            reasoning_ready = (
+                not has_reasoning_filters or
+                apply_reasoning_effort_filter_patch(
+                    model_filter_fp, validate_only=True)
+            )
+            if reasoning_ready:
+                failed_before_model_patch = len(results["failed"])
+                apply_model_filter_patch(model_filter_fp)
+                if (has_reasoning_filters and
+                        len(results["failed"]) == failed_before_model_patch):
+                    apply_reasoning_effort_filter_patch(model_filter_fp)
     else:
         legacy_model_files = []
         legacy_pattern = re.compile(

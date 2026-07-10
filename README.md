@@ -1,6 +1,6 @@
 # ChatGPT Codex — API Key 模式全功能解锁
 
-适配显示名升级为 **ChatGPT** 的 Codex 桌面应用，解锁 API key 模式下的模型列表和服务层级等功能。
+适配显示名升级为 **ChatGPT** 的 Codex 桌面应用，解锁 API key 模式下的模型列表、推理强度和服务层级等功能。
 
 已针对 Windows Store `26.707.3748.0`（app `26.707.31428`）验证。该版本的显示名和主入口已变为 ChatGPT，但 Windows 包身份仍是 `OpenAI.Codex`；脚本同时兼容新旧名称。
 
@@ -9,6 +9,7 @@
 | 功能 | 说明 |
 |------|------|
 | 最新模型列表 | 展示 app-server 已返回、但默认标记为 hidden 的模型 |
+| 完整推理强度 | API key 模式在 Advanced/Effort 展示模型实际支持的 `none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`、`ultra` |
 | Fast/Speed 模式 | 同时解除 UI 和实际请求链路的 `chatgpt` 登录限制 |
 | Plugins 插件市场 | 兼容旧门控；新版原生支持 API key 时自动跳过 |
 | 旧版连接器 UI 门控 | 仅兼容旧版前端门控；不伪造 ChatGPT 会话型连接器身份 |
@@ -27,7 +28,7 @@
 ```
 patch.py                  主脚本：ChatGPT/Codex 双名称一键流程（macOS / Windows）
 SKILL.md                  完整技术文档（含版本更新排查指南）
-tests/test_patch.py       26.707 模型/Fast 门控及幂等性回归测试
+tests/test_patch.py       26.707 模型/推理/Fast 门控及幂等性回归测试
 ```
 
 ## 使用方法
