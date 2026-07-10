@@ -11,12 +11,16 @@ ChatGPT Codex — API Key 模式全功能解锁
 
 import argparse
 import glob
+import hashlib
 import os
 import plistlib
 import re
 import shutil
+import stat
+import struct
 import subprocess
 import sys
+import tempfile
 import time
 import xml.etree.ElementTree as ET
 
@@ -26,6 +30,10 @@ import xml.etree.ElementTree as ET
 parser = argparse.ArgumentParser(description="ChatGPT Codex API Key 模式全功能解锁")
 parser.add_argument("--assets", metavar="DIR",
                     help="手动指定 webview/assets 目录，跳过 asar 解包 / fuses 步骤")
+parser.add_argument("--app", metavar="APP",
+                    help="macOS: 手动指定官方 ChatGPT/Codex .app 路径")
+parser.add_argument("--output", metavar="APP",
+                    help="macOS: 手动指定补丁副本的 .app 路径")
 parser.add_argument("--dry-run", action="store_true",
                     help="预演模式：仅打印操作，不写入文件")
 args = parser.parse_args()
@@ -38,8 +46,15 @@ WINDOWS_EXE_NAMES = ("ChatGPT.exe", "Codex.exe")
 WINDOWS_INSTALL_NAMES = ("ChatGPT", "Codex")
 # 当前 ChatGPT 品牌版本仍沿用 OpenAI.Codex 包身份；保留未来身份变更的回退。
 WINDOWS_STORE_PACKAGES = ("OpenAI.Codex", "OpenAI.ChatGPT")
-MACOS_APP_PATHS = ("/Applications/ChatGPT.app", "/Applications/Codex.app")
+MACOS_APP_PATHS = (
+    "/Applications/ChatGPT.app",
+    "/Applications/Codex.app",
+    os.path.expanduser("~/Applications/ChatGPT.app"),
+    os.path.expanduser("~/Applications/Codex.app"),
+)
 MACOS_EXE_NAMES = ("ChatGPT", "Codex")
+ASAR_PACKAGE = "@electron/asar@3.4.1"
+FUSES_PACKAGE = "@electron/fuses@1.8.0"
 
 if DRY_RUN:
     print("[DRY-RUN] 预演模式，不会实际修改文件\n")
@@ -49,7 +64,7 @@ if DRY_RUN:
 # 工具：运行子进程
 # ================================================================
 def run_cmd(cmd, capture=False):
-    """执行命令，返回 (returncode, stdout_str)。"""
+    """执行命令，返回 (returncode, output_str)。"""
     kw = {}
     if capture:
         kw["capture_output"] = True
@@ -60,8 +75,14 @@ def run_cmd(cmd, capture=False):
         cmd = subprocess.list2cmdline(cmd)
         kw["shell"] = True
     result = subprocess.run(cmd, **kw)
-    stdout = result.stdout.strip() if capture and result.stdout else ""
-    return result.returncode, stdout
+    if not capture:
+        return result.returncode, ""
+    stdout = result.stdout.strip() if result.stdout else ""
+    stderr = result.stderr.strip() if result.stderr else ""
+    output = stdout
+    if result.returncode != 0 and stderr:
+        output = "\n".join(part for part in (stdout, stderr) if part)
+    return result.returncode, output
 
 
 def _first_existing_file(base, names):
@@ -124,7 +145,7 @@ def _store_app_details(store_root):
 # ================================================================
 # 步骤 2: 关闭已验证的 ChatGPT Codex
 # ================================================================
-def step_kill_codex(exe_path):
+def step_kill_codex(exe_path, macos_app_paths=()):
     print("[2] 关闭 ChatGPT Codex 进程...")
     if DRY_RUN:
         print("    [DRY-RUN] 跳过关闭进程")
@@ -132,6 +153,10 @@ def step_kill_codex(exe_path):
     process_name = os.path.basename(exe_path)
     if IS_MACOS:
         run_cmd(["pkill", "-x", process_name])
+        for app_path in macos_app_paths:
+            contents_pattern = re.escape(
+                os.path.join(os.path.abspath(app_path), "Contents") + os.sep)
+            run_cmd(["pkill", "-f", contents_pattern])
     elif IS_WINDOWS:
         run_cmd(["taskkill", "/F", "/IM", process_name])
     time.sleep(1)
@@ -151,15 +176,18 @@ def step_detect():
     print("[1] 定位 ChatGPT Codex 安装目录...")
 
     if IS_MACOS:
-        for app in MACOS_APP_PATHS:
+        app_paths = MACOS_APP_PATHS
+        if args.app:
+            app_paths = (os.path.abspath(os.path.expanduser(args.app)),)
+        for app in app_paths:
             resources = os.path.join(app, "Contents", "Resources")
             exe = _macos_executable(app) if os.path.isdir(app) else None
             if exe is None or not _is_codex_resources(resources):
                 continue
             print(f"  检测到 macOS 版: {app} ({os.path.basename(exe)})")
             return app, resources, exe, False
-        else:
-            _die("未找到 /Applications/ChatGPT.app 或 /Applications/Codex.app。")
+        searched = "、".join(app_paths)
+        _die(f"未找到有效的 macOS ChatGPT/Codex app。已检查: {searched}")
 
     if IS_WINDOWS:
         local = os.environ.get("LOCALAPPDATA", "")
@@ -283,7 +311,7 @@ def step_extract_asar(resources_dir):
     if os.path.isdir(app_dir):
         shutil.rmtree(app_dir)
 
-    rc, _ = run_cmd(["npx", "--yes", "@electron/asar", "e", asar, app_dir])
+    rc, _ = run_cmd(["npx", "--yes", ASAR_PACKAGE, "e", asar, app_dir])
     if rc != 0:
         _die("asar 提取失败，请确认 Node.js 已安装（npx 可用）。")
     print("    提取到 app/ 完成。")
@@ -313,7 +341,7 @@ def step_repack_asar(resources_dir):
     # 原生模块 (.node) 及 node-pty/better-sqlite3 必须解包到磁盘，
     # 否则 Electron 无法 dlopen 原生扩展。
     rc, _ = run_cmd([
-        "npx", "--yes", "@electron/asar", "pack", app_dir, asar,
+        "npx", "--yes", ASAR_PACKAGE, "pack", app_dir, asar,
         "--unpack-dir", "{**/node_modules/node-pty,**/node_modules/better-sqlite3}",
         "--unpack", "**/*.node",
     ])
@@ -402,6 +430,322 @@ def _single_patch_target(files, name, required=True):
     return None
 
 
+def _function_spans(content):
+    """Yield minified named-function spans without attempting to parse JS."""
+    identifier = r'[a-zA-Z_$][a-zA-Z0-9_$]*'
+    matches = list(re.finditer(
+        rf'function[ \t]+{identifier}[ \t]*\(', content))
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(content)
+        yield match.start(), end
+
+
+def _statsig_gate_assignment(function_body, feature_name, availability_field):
+    """Find the Statsig assignment consumed by one desktop availability check."""
+    identifier = r'[a-zA-Z_$][a-zA-Z0-9_$]*'
+    feature_marker = f"featureName:`{feature_name}`"
+    if feature_marker not in function_body:
+        return None
+
+    assignment_pattern = re.compile(
+        rf'(?P<gate>{identifier})=(?P<forced>true\|\|)?'
+        rf'(?P<hook>{identifier})\(`(?P<gate_id>[0-9]+)`\)'
+    )
+    candidates = []
+    for assignment in assignment_pattern.finditer(function_body):
+        gate = assignment.group("gate")
+        if re.search(
+                rf'{re.escape(availability_field)}[ \t]*:[ \t]*'
+                rf'{re.escape(gate)}(?=[,}}])',
+                function_body[assignment.end():]):
+            candidates.append(assignment)
+    return candidates
+
+
+def _react_auth_context(content):
+    """Find the renderer auth context already used by the target chunk."""
+    identifier = r'[a-zA-Z_$][a-zA-Z0-9_$]*'
+    pattern = re.compile(
+        rf'\(0,(?P<react>{identifier})\.useContext\)\('
+        rf'(?P<context>{identifier})\)\?\.authMethod===`chatgpt`'
+    )
+    candidates = {
+        (match.group("react"), match.group("context"))
+        for match in pattern.finditer(content)
+    }
+    return next(iter(candidates)) if len(candidates) == 1 else None
+
+
+def _auth_method_hook(content):
+    """Find the existing hook that returns the renderer authentication state."""
+    identifier = r'[a-zA-Z_$][a-zA-Z0-9_$]*'
+    pattern = re.compile(
+        rf'\{{[^{{}}]*authMethod(?:[ \t]*:[ \t]*{identifier})?[^{{}}]*\}}'
+        rf'[ \t]*=[ \t]*(?P<hook>{identifier})\(\)'
+    )
+    candidates = {match.group("hook") for match in pattern.finditer(content)}
+    return next(iter(candidates)) if len(candidates) == 1 else None
+
+
+def apply_browser_computer_use_gate_patch(fp):
+    """Enable API-key desktop features while retaining real capability checks."""
+    with open(fp, encoding="utf-8") as fh:
+        content = fh.read()
+    bn = os.path.basename(fp)
+    gates = (
+        ("browser_use", "isBrowserAgentGateEnabled", "内置 Browser 可用性"),
+        ("browser_use_external", "isExternalBrowserUseGateEnabled",
+         "外部 Browser 可用性"),
+        ("computer_use", "isComputerUseGateEnabled", "Computer Use 可用性"),
+    )
+    auth_context = _react_auth_context(content)
+    if auth_context is None:
+        mark_missing(f"{bn}: Browser / Computer Use API key 范围", "认证上下文不明确")
+        return
+    react, context = auth_context
+    identifier = r'[a-zA-Z_$][a-zA-Z0-9_$]*'
+    patched_assignment_pattern = re.compile(
+        rf'(?P<gate>{identifier})=\[(?P<hook>{identifier})\('
+        rf'`(?P<gate_id>[0-9]+)`\),\(0,{re.escape(react)}\.useContext\)\('
+        rf'{re.escape(context)}\)\?\.authMethod===`apikey`\]\.some\(Boolean\)'
+    )
+
+    replacements = []
+    skipped = []
+    validation_failed = False
+    for feature_name, availability_field, patch_name in gates:
+        candidates = []
+        for start, end in _function_spans(content):
+            function_body = content[start:end]
+            if f"featureName:`{feature_name}`" not in function_body:
+                continue
+            matches = _statsig_gate_assignment(
+                function_body, feature_name, availability_field)
+            if matches:
+                candidates.extend(
+                    (start + match.start(), start + match.end(), match, False)
+                    for match in matches
+                )
+            for match in patched_assignment_pattern.finditer(function_body):
+                gate = match.group("gate")
+                if re.search(
+                        rf'{re.escape(availability_field)}[ \t]*:[ \t]*'
+                        rf'{re.escape(gate)}(?=[,}}])',
+                        function_body[match.end():]):
+                    candidates.append(
+                        (start + match.start(), start + match.end(), match, True)
+                    )
+
+        if len(candidates) != 1:
+            reason = "目标结构不匹配"
+            if len(candidates) > 1:
+                reason = f"找到 {len(candidates)} 个目标"
+            mark_missing(f"{bn}: {patch_name}", reason)
+            validation_failed = True
+            continue
+
+        start, end, match, already_patched = candidates[0]
+        if already_patched:
+            skipped.append(patch_name)
+            continue
+        replacement = (
+            f"{match.group('gate')}=[{match.group('hook')}"
+            f"(`{match.group('gate_id')}`),(0,{react}.useContext)({context})"
+            "?.authMethod===`apikey`].some(Boolean)"
+        )
+        replacements.append((start, end, replacement, patch_name))
+
+    if validation_failed:
+        return
+    if not DRY_RUN and replacements:
+        for start, end, replacement, _ in sorted(replacements, reverse=True):
+            content = content[:start] + replacement + content[end:]
+        with open(fp, "w", encoding="utf-8") as fh:
+            fh.write(content)
+    for _, _, _, patch_name in replacements:
+        results["applied"].append(f"{bn}: {patch_name}")
+        print(f"    [OK]   {patch_name}")
+    for patch_name in skipped:
+        results["skipped"].append(f"{bn}: {patch_name}")
+        print(f"    [SKIP] {patch_name}")
+
+
+def apply_computer_use_node_repl_gate_patch(fp):
+    """Enable the current Computer Use runtime variant when CUA is available."""
+    with open(fp, encoding="utf-8") as fh:
+        content = fh.read()
+    bn = os.path.basename(fp)
+    identifier = r'[a-zA-Z_$][a-zA-Z0-9_$]*'
+    auth_hook = _auth_method_hook(content)
+    patch_name = "Computer Use Node runtime"
+    if auth_hook is None:
+        mark_missing(f"{bn}: {patch_name}", "认证 hook 不明确")
+        return
+    candidates = []
+    for function_start, function_end in _function_spans(content):
+        function_body = content[function_start:function_end]
+        field = re.search(
+            rf'computerUseNodeRepl[ \t]*:[ \t]*{identifier}\.available&&'
+            rf'(?P<gate>{identifier})(?=[,}}])', function_body)
+        if field is None:
+            continue
+        gate = field.group("gate")
+        assignments = list(re.finditer(
+            rf'(?P<gate>{re.escape(gate)})=(?P<forced>true\|\|)?'
+            rf'(?P<hook>{identifier})\(`(?P<gate_id>[0-9]+)`\)',
+            function_body[:field.start()],
+        ))
+        candidates.extend(
+            (function_start + match.start(), function_start + match.end(), match, False)
+            for match in assignments
+        )
+        patched_pattern = re.compile(
+            rf'(?P<gate>{re.escape(gate)})=\[(?P<hook>{identifier})\('
+            rf'`(?P<gate_id>[0-9]+)`\),{re.escape(auth_hook)}\(\)'
+            r'\?\.authMethod===`apikey`\]\.some\(Boolean\)'
+        )
+        candidates.extend(
+            (function_start + match.start(), function_start + match.end(), match, True)
+            for match in patched_pattern.finditer(function_body[:field.start()])
+        )
+
+    if len(candidates) != 1:
+        reason = "目标结构不匹配"
+        if len(candidates) > 1:
+            reason = f"找到 {len(candidates)} 个目标"
+        mark_missing(f"{bn}: {patch_name}", reason)
+        return
+
+    start, end, match, already_patched = candidates[0]
+    if already_patched:
+        results["skipped"].append(f"{bn}: {patch_name}")
+        print(f"    [SKIP] {patch_name}")
+        return
+
+    replacement = (
+        f"{match.group('gate')}=[{match.group('hook')}"
+        f"(`{match.group('gate_id')}`),{auth_hook}()?.authMethod==="
+        "`apikey`].some(Boolean)"
+    )
+    if not DRY_RUN:
+        content = content[:start] + replacement + content[end:]
+        with open(fp, "w", encoding="utf-8") as fh:
+            fh.write(content)
+    results["applied"].append(f"{bn}: {patch_name}")
+    print(f"    [OK]   {patch_name}")
+
+
+def apply_browser_peer_authorization_patch(fp):
+    """Apply the narrow peer fallback and make its native pipe owner-only."""
+    with open(fp, encoding="utf-8") as fh:
+        content = fh.read()
+    bn = os.path.basename(fp)
+    patch_name = "Browser macOS peer authorization fallback"
+    identifier = r'[a-zA-Z_$][a-zA-Z0-9_$]*'
+    authorization_pattern = re.compile(
+        rf'(?P<socket>{identifier})=>\{{let (?P<fd>{identifier})='
+        rf'(?P<fd_fn>{identifier})\((?P=socket)\);return '
+        rf'(?P=fd)==null\?\{{authorized:!1,'
+        r'reason:`missing-socket-file-descriptor`\}:'
+        rf'(?P<addon>{identifier})\.authorizeSocketPeer\('
+        rf'(?P=fd),(?P<dev>{identifier})\)\}}'
+    )
+    patched_authorization_pattern = re.compile(
+        rf'(?P<socket>{identifier})=>\{{let (?P<fd>{identifier})='
+        rf'(?P<fd_fn>{identifier})\((?P=socket)\),'
+        rf'(?P<authorization>{identifier})=(?P=fd)==null\?\{{authorized:!1,'
+        r'reason:`missing-socket-file-descriptor`\}:'
+        rf'(?P<addon>{identifier})\.authorizeSocketPeer\('
+        rf'(?P=fd),(?P<dev>{identifier})\);return!'
+        rf'(?P=authorization)\.authorized&&(?P=authorization)\.reason==='
+        r'`missing-code-signing-identity`\?\{authorized:!0\}:'
+        rf'(?P=authorization)\}}'
+    )
+    authorization_matches = list(authorization_pattern.finditer(content))
+    patched_authorization_matches = list(
+        patched_authorization_pattern.finditer(content))
+    if len(authorization_matches) + len(patched_authorization_matches) != 1:
+        reason = "目标结构不匹配"
+        match_count = len(authorization_matches) + len(
+            patched_authorization_matches)
+        if match_count > 1:
+            reason = f"找到 {match_count} 个授权目标"
+        mark_missing(f"{bn}: {patch_name}", reason)
+        return
+    authorization_is_patched = bool(patched_authorization_matches)
+
+    chmod_source_pattern = re.compile(
+        rf'onListening:(?P<arg>{identifier})=>\{{\(0,'
+        rf'(?P<fs>{identifier})\.chmodSync\)\((?P=arg),384\),'
+        rf'{identifier}\(\)\.info\(`node_repl_host_services_listening`'
+    )
+    chmod_sources = list(chmod_source_pattern.finditer(content))
+    if len(chmod_sources) != 1:
+        reason = "未找到唯一的 chmod 依赖"
+        if len(chmod_sources) > 1:
+            reason = f"找到 {len(chmod_sources)} 个 chmod 依赖"
+        mark_missing(f"{bn}: {patch_name}", reason)
+        return
+    fs_module = chmod_sources[0].group("fs")
+
+    listener_pattern = re.compile(
+        rf'onListening:(?P<arg>{identifier})=>\{{'
+        rf'(?P<chmod>\(0,{re.escape(fs_module)}\.chmodSync\)\('
+        rf'(?P=arg),384\),)?'
+        rf'{identifier}\(\)\.info\(`browser-use native pipe listening`'
+    )
+    listener_matches = list(listener_pattern.finditer(content))
+    if len(listener_matches) != 1:
+        reason = "未找到唯一的 Browser socket listener"
+        if len(listener_matches) > 1:
+            reason = f"找到 {len(listener_matches)} 个 Browser socket listener"
+        mark_missing(f"{bn}: {patch_name}", reason)
+        return
+    listener_match = listener_matches[0]
+    listener_is_patched = listener_match.group("chmod") is not None
+
+    replacements = []
+    if not authorization_is_patched:
+        match = authorization_matches[0]
+        authorization = "_peerAuthorization"
+        used_identifiers = set(re.findall(identifier, content))
+        suffix = 2
+        while authorization in used_identifiers:
+            authorization = f"_peerAuthorization{suffix}"
+            suffix += 1
+        replacement = (
+            f"{match.group('socket')}=>{{let {match.group('fd')}="
+            f"{match.group('fd_fn')}({match.group('socket')}),{authorization}="
+            f"{match.group('fd')}==null?{{authorized:!1,"
+            "reason:`missing-socket-file-descriptor`}:"
+            f"{match.group('addon')}.authorizeSocketPeer("
+            f"{match.group('fd')},{match.group('dev')});return!"
+            f"{authorization}.authorized&&{authorization}.reason==="
+            "`missing-code-signing-identity`?{authorized:!0}:"
+            f"{authorization}}}"
+        )
+        replacements.append((match.start(), match.end(), replacement))
+    if not listener_is_patched:
+        insert_at = listener_match.start() + listener_match.group(0).index("{") + 1
+        chmod = (
+            f"(0,{fs_module}.chmodSync)("
+            f"{listener_match.group('arg')},384),"
+        )
+        replacements.append((insert_at, insert_at, chmod))
+
+    if not replacements:
+        results["skipped"].append(f"{bn}: {patch_name}")
+        print(f"    [SKIP] {patch_name}")
+        return
+    if not DRY_RUN:
+        for start, end, replacement in sorted(replacements, reverse=True):
+            content = content[:start] + replacement + content[end:]
+        with open(fp, "w", encoding="utf-8") as fh:
+            fh.write(content)
+    results["applied"].append(f"{bn}: {patch_name}")
+    print(f"    [OK]   {patch_name}")
+
+
 def _native_apikey_plugins_file(assets):
     identifier = r'[a-zA-Z_$][a-zA-Z0-9_$]*'
     pattern = re.compile(
@@ -412,11 +756,43 @@ def _native_apikey_plugins_file(assets):
         r'(?P=arg)[ \t]*!==[ \t]*`apikey`'
         r'(?=[ \t]*(?:&&|\)|;|\}))'
     )
-    for fp in _find(assets, "use-plugins-*.js"):
+    candidates = _find(assets, "use-plugins-*.js")
+    candidates.extend(glob.glob(os.path.join(assets, "*.js")))
+    for fp in sorted(set(candidates)):
         with open(fp, encoding="utf-8") as fh:
             if pattern.search(fh.read()):
                 return fp
     return None
+
+
+def _model_filter_signature(content, bn, patch_name, required_fields):
+    identifier = r'[a-zA-Z_$][a-zA-Z0-9_$]*'
+    signature_pattern = re.compile(
+        rf'function[ \t]+{identifier}[ \t]*\(\{{(?P<fields>[^}}]*)\}}\)[ \t]*\{{'
+    )
+    target_signatures = []
+    for signature_match in signature_pattern.finditer(content):
+        fields = signature_match.group("fields")
+        aliases = {}
+        for field in required_fields:
+            field_match = re.search(
+                rf'(?:^|,)[ \t]*{re.escape(field)}'
+                rf'(?::(?P<alias>{identifier}))?[ \t]*(?=,|$)',
+                fields,
+            )
+            if field_match is None:
+                break
+            aliases[field] = field_match.group("alias") or field
+        else:
+            target_signatures.append((signature_match, aliases))
+
+    if len(target_signatures) != 1:
+        reason = "目标结构不匹配"
+        if len(target_signatures) > 1:
+            reason = f"找到 {len(target_signatures)} 个目标函数"
+        mark_missing(f"{bn}: {patch_name}", reason)
+        return None
+    return target_signatures[0]
 
 
 def apply_model_filter_patch(fp):
@@ -424,40 +800,44 @@ def apply_model_filter_patch(fp):
         content = fh.read()
     bn = os.path.basename(fp)
 
-    auth_match = re.search(
-        r'function [a-zA-Z_$]+\(\{[^}]*\bauthMethod'
-        r'(?::(?P<auth>[a-zA-Z_$]+))?(?:,|\})',
+    target = _model_filter_signature(
         content,
+        bn,
+        "隐藏模型列表解锁",
+        ("authMethod", "useHiddenModels"),
     )
+    if target is None:
+        return
+
+    signature_match, aliases = target
+    auth = aliases["authMethod"]
+    identifier = r'[a-zA-Z_$][a-zA-Z0-9_$]*'
+    next_function = re.search(
+        rf'function[ \t]+{identifier}[ \t]*\(', content[signature_match.end():]
+    )
+    function_end = (
+        signature_match.end() + next_function.start()
+        if next_function is not None
+        else len(content)
+    )
+    function_body = content[signature_match.end():function_end]
     condition_pattern = re.compile(
         r'if\((?P<mode>[a-zA-Z_$]+)\?'
         r'(?P<allowed>[a-zA-Z_$]+)\.has\('
         r'(?P<model>[a-zA-Z_$]+)\.model\):!'
         r'(?P=model)\.hidden\)\{'
     )
-    if auth_match is None or "useHiddenModels" not in auth_match.group(0):
-        # authMethod may appear before useHiddenModels; validate against the full signature.
-        signature_match = re.search(
-            r'function [a-zA-Z_$]+\(\{(?P<fields>[^}]*)\}\)\{', content)
-        if signature_match is None or "useHiddenModels" not in signature_match.group("fields"):
-            mark_missing(f"{bn}: 隐藏模型列表解锁", "目标结构不匹配")
-            return
-    if auth_match is None:
-        mark_missing(f"{bn}: 隐藏模型列表解锁", "目标结构不匹配")
-        return
-
-    auth = auth_match.group("auth") or "authMethod"
     patched_pattern = re.compile(
         rf'if\({re.escape(auth)}===`apikey`\|\|\('
         r'[a-zA-Z_$]+\?[a-zA-Z_$]+\.has\('
         r'([a-zA-Z_$]+)\.model\):!\1\.hidden\)\)\{'
     )
-    if patched_pattern.search(content):
+    if patched_pattern.search(function_body):
         results["skipped"].append(f"{bn}: 隐藏模型列表解锁")
         print("    [SKIP] 隐藏模型列表解锁")
         return
 
-    condition_match = condition_pattern.search(content)
+    condition_match = condition_pattern.search(function_body)
     if condition_match is None:
         mark_missing(f"{bn}: 隐藏模型列表解锁", "目标结构不匹配")
         return
@@ -470,7 +850,9 @@ def apply_model_filter_patch(fp):
         f"({mode}?{allowed}.has({model}.model):!{model}.hidden)){{"
     )
     if not DRY_RUN:
-        content = content.replace(condition_match.group(0), patched, 1)
+        start = signature_match.end() + condition_match.start()
+        end = signature_match.end() + condition_match.end()
+        content = content[:start] + patched + content[end:]
         with open(fp, "w", encoding="utf-8") as fh:
             fh.write(content)
     results["applied"].append(f"{bn}: 隐藏模型列表解锁 (regex)")
@@ -545,6 +927,8 @@ def apply_reasoning_effort_filter_patch(fp, validate_only=False):
         "authMethod",
         "enabledReasoningEfforts",
         "includeUltraReasoningEffort",
+        "models",
+        "useHiddenModels",
     )
     for match in signature_pattern.finditer(content):
         aliases = {
@@ -801,21 +1185,120 @@ def step_patch_js(assets):
     # 注: 旧版"插件侧边栏 (pluginsDisabledTooltip)"已被移除，
     #     插件门控现由模块 4 的 ge() 函数统一控制。
     print("\n  [模块 3] i18n 多语言")
-    files = _find(assets, "app-main-*.js")
-    if not files:
-        for f in glob.glob(os.path.join(assets, "*.js")):
-            with open(f, encoding="utf-8") as fh:
-                if "enable_i18n" in fh.read():
-                    files = [f]; break
-    for fp in files:
-        apply_patch(fp, "i18n 多语言强制启用",
+    i18n_target = re.compile(
+        r'[a-zA-Z_$]+=[a-zA-Z_$]+\?\.get\(`enable_i18n`,!1\)'
+    )
+    i18n_patched = re.compile(
+        r'=true\|\|[a-zA-Z_$]+\?\.get\(`enable_i18n`,!1\)'
+    )
+    files = []
+    for fp in glob.glob(os.path.join(assets, "*.js")):
+        with open(fp, encoding="utf-8") as fh:
+            content = fh.read()
+        if i18n_target.search(content) or i18n_patched.search(content):
+            files.append(fp)
+    i18n_fp = _single_patch_target(
+        files, "i18n 多语言强制启用", required=False)
+    if i18n_fp is not None:
+        apply_patch(i18n_fp, "i18n 多语言强制启用",
             None, None,
             r'([a-zA-Z_$]+)=([a-zA-Z_$]+)\?\.get\(`enable_i18n`,!1\)',
             lambda m: f"{m.group(1)}=true||{m.group(2)}?.get(`enable_i18n`,!1)",
             skip_regex=r'=true\|\|[a-zA-Z_$]+\?\.get\(`enable_i18n`,!1\)')
 
-    # ── 模块 4: 旧版插件连接器 UI 门控 (1 补丁) ─────────────────
-    print("\n  [模块 4] 旧版插件连接器 UI 门控")
+    # ── 模块 4: Browser / Computer Use (5 补丁) ──────────────────
+    # API key 会话没有 ChatGPT Statsig 用户上下文，三个桌面可用性 gate
+    # 会返回 statsig-disabled，主进程随后会从 bundled marketplace 移除
+    # browser/chrome/computer-use。这里只让 API key 与原 gate 取 OR；其他
+    # 认证模式保留 Statsig 结果，平台、WSL、app-server experimental feature
+    # 与插件配置检查也仍由原逻辑执行。
+    print("\n  [模块 4] Browser / Computer Use")
+    desktop_gate_files = []
+    desktop_gate_feature_present = False
+    desktop_gate_markers = (
+        "featureName:`browser_use`",
+        "isBrowserAgentGateEnabled",
+        "featureName:`browser_use_external`",
+        "isExternalBrowserUseGateEnabled",
+        "featureName:`computer_use`",
+        "isComputerUseGateEnabled",
+    )
+    for fp in glob.glob(os.path.join(assets, "*.js")):
+        with open(fp, encoding="utf-8") as fh:
+            content = fh.read()
+        desktop_gate_feature_present = (
+            desktop_gate_feature_present
+            or any(marker in content for marker in desktop_gate_markers)
+        )
+        if all(marker in content for marker in desktop_gate_markers):
+            desktop_gate_files.append(fp)
+    desktop_gate_fp = _single_patch_target(
+        desktop_gate_files,
+        "Browser / Computer Use 可用性",
+        required=desktop_gate_feature_present,
+    )
+    if desktop_gate_fp is not None:
+        apply_browser_computer_use_gate_patch(desktop_gate_fp)
+
+    node_runtime_files = []
+    node_runtime_feature_present = False
+    node_runtime_pattern = re.compile(
+        r'computerUseNodeRepl[ \t]*:[ \t]*'
+        r'[a-zA-Z_$][a-zA-Z0-9_$]*\.available&&'
+        r'[a-zA-Z_$][a-zA-Z0-9_$]*'
+    )
+    for fp in glob.glob(os.path.join(assets, "*.js")):
+        with open(fp, encoding="utf-8") as fh:
+            content = fh.read()
+        node_runtime_feature_present = (
+            node_runtime_feature_present or "computerUseNodeRepl" in content
+        )
+        if node_runtime_pattern.search(content):
+            node_runtime_files.append(fp)
+    node_runtime_fp = _single_patch_target(
+        node_runtime_files,
+        "Computer Use Node runtime",
+        required=node_runtime_feature_present,
+    )
+    if node_runtime_fp is not None:
+        apply_computer_use_node_repl_gate_patch(node_runtime_fp)
+
+    # macOS 补丁副本的外层 app 是 ad-hoc 签名。Browser native addon 会沿
+    # responsible-process 链返回 missing-code-signing-identity，即便实际的
+    # node -> codex sandbox -> node_repl 都保留 OpenAI 签名。只对此原因降级，
+    # 继续保留 untrusted identity 与 missing fd 的拒绝路径。
+    main_build = None
+    if (IS_MACOS and
+            os.path.basename(os.path.normpath(assets)) == "assets" and
+            os.path.basename(os.path.dirname(os.path.normpath(assets))) ==
+            "webview"):
+        main_build = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.normpath(assets))),
+            ".vite", "build")
+    peer_auth_files = []
+    peer_auth_feature_present = False
+    if main_build and os.path.isdir(main_build):
+        for fp in _find(main_build, "main-*.js"):
+            with open(fp, encoding="utf-8") as fh:
+                content = fh.read()
+            peer_auth_feature_present = (
+                peer_auth_feature_present
+                or "browser-use-peer-authorization.node" in content
+            )
+            if ("browser-use-peer-authorization.node" in content and
+                    "authorizeSocketPeer" in content and
+                    "missing-socket-file-descriptor" in content):
+                peer_auth_files.append(fp)
+    peer_auth_fp = _single_patch_target(
+        peer_auth_files,
+        "Browser macOS peer authorization fallback",
+        required=peer_auth_feature_present,
+    )
+    if peer_auth_fp is not None:
+        apply_browser_peer_authorization_patch(peer_auth_fp)
+
+    # ── 模块 5: 旧版插件连接器 UI 门控 (1 补丁) ─────────────────
+    print("\n  [模块 5] 旧版插件连接器 UI 门控")
     native_plugins_fp = _native_apikey_plugins_file(assets)
     files = _find(assets, "check-plugin-availability-*.js")
     if files:
@@ -832,12 +1315,12 @@ def step_patch_js(assets):
             "新版已移除该旧补丁点",
         )
 
-    # ── 模块 5: 品牌视觉 + 插件市场门控 (1 补丁) ────────────────
+    # ── 模块 6: 品牌视觉 + 插件市场门控 (1 补丁) ────────────────
     # 新版 (26.602+): use-plugins-*.js 中 function ge(e){return e!==`chatgpt`}
     #   该函数同时控制品牌视觉与插件侧边栏可用性。
     #   注意: 函数名(ge) 与参数名(e) 不再相同。
     # 旧版: plugin-auth-*.js / gradient-*.js
-    print("\n  [模块 5] 品牌视觉 + 插件市场门控")
+    print("\n  [模块 6] 品牌视觉 + 插件市场门控")
     if native_plugins_fp is not None:
         mark_satisfied(
             native_plugins_fp,
@@ -867,20 +1350,27 @@ def step_patch_js(assets):
                 lambda m: f"function {m.group(1)}({m.group(2)}){{return false&&{m.group(2)}!==`chatgpt`}}",
                 skip_regex=r'function [a-zA-Z_$]+\([a-zA-Z_$]+\)\{return false&&[a-zA-Z_$]+!==`chatgpt`\}')
 
-    # ── 模块 6: 语音输入 (1 补丁) ────────────────────────────────
+    # ── 模块 7: 语音输入 (1 补丁) ────────────────────────────────
     # 新版 (26.602+): use-is-dictation-supported-*.js 中 n&&t.authMethod===`chatgpt`
     # 旧版: annotation-comment-editor-card-*.js
-    print("\n  [模块 6] 语音输入")
+    print("\n  [模块 7] 语音输入")
     files = _find(assets, "use-is-dictation-supported-*.js")
     if not files:
         files = _find(assets, "annotation-comment-editor-card-*.js")
     if not files:
         # 精确匹配：含 dictation 判定模式的文件，避免误选 app-main
+        dictation_original = re.compile(
+            r'[a-zA-Z_$]+&&[a-zA-Z_$]+\.authMethod===`chatgpt`'
+        )
+        dictation_patched = re.compile(
+            r'[a-zA-Z_$]+&&\([a-zA-Z_$]+\.authMethod===`chatgpt`\|\|'
+            r'[a-zA-Z_$]+\.authMethod===`apikey`\)'
+        )
         for f in glob.glob(os.path.join(assets, "*.js")):
             with open(f, encoding="utf-8") as fh:
                 c = fh.read()
-            if "dictation" in c.lower() and re.search(
-                    r'[a-zA-Z_$]+&&[a-zA-Z_$]+\.authMethod===`chatgpt`', c):
+            if "dictation" in c.lower() and (
+                    dictation_original.search(c) or dictation_patched.search(c)):
                 files = [f]; break
     for fp in files:
         apply_patch(fp, "语音输入解锁",
@@ -889,8 +1379,8 @@ def step_patch_js(assets):
             lambda m: f"{m.group(1)}&&({m.group(2)}.authMethod===`chatgpt`||{m.group(2)}.authMethod===`apikey`)",
             skip_regex=r'authMethod===`chatgpt`\|\|[a-zA-Z_$]+\.authMethod===`apikey`')
 
-    # ── 模块 7: 用量设置 (1 补丁) ────────────────────────────────
-    print("\n  [模块 7] 用量设置")
+    # ── 模块 8: 用量设置 (1 补丁) ────────────────────────────────
+    print("\n  [模块 8] 用量设置")
     files = _find(assets, "use-usage-settings-access-*.js")
     if not files:
         for f in glob.glob(os.path.join(assets, "*.js")):
@@ -903,6 +1393,12 @@ def step_patch_js(assets):
             r'let\s+([a-zA-Z_$]+)=([a-zA-Z_$]+)===`chatgpt`(?!\|\|)',
             lambda m: f"let {m.group(1)}={m.group(2)}===`chatgpt`||{m.group(2)}===`apikey`",
             skip_regex=r'let [a-zA-Z_$]+=[a-zA-Z_$]+===`chatgpt`\|\|[a-zA-Z_$]+===`apikey`')
+
+
+def _require_successful_js_patch():
+    """Stop a full build before packaging or signing any partial JS result."""
+    if results["failed"]:
+        _die("JS 补丁校验失败，已停止重打包与签名。")
 
 
 # ================================================================
@@ -924,7 +1420,7 @@ def step_fuses(exe_path):
     no_sentinel = False
     for flag in flags:
         rc, out = run_cmd(
-            ["npx", "--yes", "@electron/fuses", "write", "--app", exe_path, flag],
+            ["npx", "--yes", FUSES_PACKAGE, "write", "--app", exe_path, flag],
             capture=True)
         if rc != 0:
             if "sentinel" in out.lower():
@@ -944,15 +1440,52 @@ def step_fuses(exe_path):
 # ================================================================
 # 步骤 3 (仅 macOS): 复制官方 app 到独立副本
 # ================================================================
-# 说明: macOS TCC 权限(屏幕录制/辅助功能/自动化)绑定到代码的签名身份
-# (Designated Requirement)，而非 bundle id。若直接修改官方 app
-# 并 ad-hoc 重签名，会让系统把它当成另一个 app，导致 Appshots/Computer Use
-# 依赖的权限失效(见 GitHub issue #1)。
-# 因此改为: 官方 app 原样保留(继续供 Appshots/Computer Use 使用)，
-# 补丁只打到独立副本上，副本仅用于 API key 解锁功能。
+# 说明: macOS 主 app 的 TCC 权限(屏幕录制/辅助功能/自动化)绑定到代码的
+# 签名身份(Designated Requirement)，而非 bundle id。若直接修改官方 app
+# 并 ad-hoc 重签名，系统会把它当成另一个 app。官方 app 因此原样保留，
+# 作为 Appshots 与原始主 app TCC 身份的回退；补丁只写入独立副本。
+# Computer Use 使用另一个保持 OpenAI 签名的辅助 app，不依赖副本的 Team ID。
 
 
-def step_copy_macos(official_app):
+def _macos_patched_path(official_app, requested_output=None):
+    source_exe = _macos_executable(official_app)
+    if source_exe is None:
+        _die(f"未找到 ChatGPT/Codex 可执行文件: {official_app}")
+    patched_name = (
+        "ChatGPT-Codex-Patched.app"
+        if os.path.basename(source_exe) == "ChatGPT"
+        else "Codex-Patched.app"
+    )
+    if requested_output:
+        patched_app = os.path.abspath(os.path.expanduser(requested_output))
+        if not patched_app.lower().endswith(".app"):
+            _die("--output 必须是以 .app 结尾的路径。")
+        return patched_app
+
+    source_parent = os.path.dirname(os.path.abspath(official_app))
+    if os.access(source_parent, os.W_OK):
+        return os.path.join(source_parent, patched_name)
+    return os.path.join(os.path.expanduser("~/Applications"), patched_name)
+
+
+def _validate_macos_copy_paths(official_app, patched_app):
+    source_real = os.path.realpath(official_app)
+    output_real = os.path.realpath(patched_app)
+    try:
+        if os.path.exists(patched_app) and os.path.samefile(official_app, patched_app):
+            _die("补丁副本路径不能与官方 app 相同。")
+    except OSError as exc:
+        _die(f"无法验证 macOS app 路径: {exc}")
+
+    try:
+        common = os.path.commonpath((source_real, output_real))
+    except ValueError as exc:
+        _die(f"无法验证 macOS app 路径: {exc}")
+    if common in (source_real, output_real):
+        _die("官方 app 与补丁副本路径不能相同或互相包含。")
+
+
+def step_copy_macos(official_app, requested_output=None):
     """
     将官方 ChatGPT/Codex app 复制到独立 Patched 副本
     （保留所有属性/符号链接/扩展属性）。
@@ -962,46 +1495,172 @@ def step_copy_macos(official_app):
     if source_exe is None:
         _die(f"未找到 ChatGPT/Codex 可执行文件: {official_app}")
     exe_name = os.path.basename(source_exe)
-    patched_name = (
-        "ChatGPT-Codex-Patched.app"
-        if exe_name == "ChatGPT"
-        else "Codex-Patched.app"
-    )
-    patched_app = os.path.join("/Applications", patched_name)
+    patched_app = _macos_patched_path(official_app, requested_output)
     resources   = os.path.join(patched_app, "Contents", "Resources")
     exe         = os.path.join(patched_app, "Contents", "MacOS", exe_name)
+    _validate_macos_copy_paths(official_app, patched_app)
 
     print("[3] 复制官方 app 到独立副本...")
     print(f"    {official_app}")
     print(f"    -> {patched_app}")
-    print(f"    (官方 {official_app} 保持不变，Appshots/Computer Use 不受影响)")
+    print(f"    (官方 {official_app} 保持不变，保留原始签名与 TCC 身份)")
 
     if DRY_RUN:
         print("    [DRY-RUN] 跳过复制")
         return patched_app, resources, exe
 
+    os.makedirs(os.path.dirname(patched_app), exist_ok=True)
     if os.path.exists(patched_app):
         shutil.rmtree(patched_app)
 
-    # ditto 完整保留 bundle 结构、符号链接与扩展属性，得到与官方一致的初始副本
+    # 完整保留 bundle 结构、符号链接与扩展属性；收尾时仅移除 quarantine。
     rc, _ = run_cmd(["ditto", official_app, patched_app])
     if rc != 0:
-        _die("复制 Codex.app 失败，请确认有写入 /Applications 的权限。")
+        _die(f"复制 app 失败，请确认目标目录可写: {os.path.dirname(patched_app)}")
 
     print("    复制完成。")
     return patched_app, resources, exe
+
+
+def _asar_header_hash(asar_path):
+    """Return Electron's SHA-256 integrity hash for an ASAR JSON header."""
+    try:
+        with open(asar_path, "rb") as fh:
+            size_pickle = fh.read(8)
+            if len(size_pickle) != 8:
+                raise ValueError("ASAR size header is truncated")
+            header_size = struct.unpack_from("<I", size_pickle, 4)[0]
+            header_pickle = fh.read(header_size)
+        if len(header_pickle) != header_size or header_size < 8:
+            raise ValueError("ASAR JSON header is truncated")
+        string_size = struct.unpack_from("<I", header_pickle, 4)[0]
+        header = header_pickle[8:8 + string_size]
+        if len(header) != string_size:
+            raise ValueError("ASAR JSON header has an invalid size")
+    except (OSError, struct.error, ValueError) as exc:
+        raise ValueError(f"无法读取 ASAR header: {asar_path}") from exc
+    return hashlib.sha256(header).hexdigest()
+
+
+def step_update_macos_asar_integrity(app_path):
+    print("\n[6] 更新 macOS ASAR 完整性信息...")
+    if DRY_RUN:
+        print("    [DRY-RUN] 跳过完整性信息更新")
+        return
+
+    info_plist = os.path.join(app_path, "Contents", "Info.plist")
+    asar = os.path.join(app_path, "Contents", "Resources", "app.asar")
+    try:
+        with open(info_plist, "rb") as fh:
+            original = fh.read()
+        info = plistlib.loads(original)
+    except (OSError, plistlib.InvalidFileException) as exc:
+        _die(f"无法读取 Info.plist: {info_plist} ({exc})")
+
+    integrity = info.get("ElectronAsarIntegrity")
+    entry = integrity.get("Resources/app.asar") if isinstance(integrity, dict) else None
+    if not isinstance(entry, dict):
+        print("    未声明 ElectronAsarIntegrity，无需更新。")
+        return
+    if str(entry.get("algorithm", "SHA256")).upper() != "SHA256":
+        _die("Info.plist 使用了不支持的 ASAR 完整性算法。")
+
+    try:
+        entry["algorithm"] = "SHA256"
+        entry["hash"] = _asar_header_hash(asar)
+    except ValueError as exc:
+        _die(str(exc))
+
+    plist_format = plistlib.FMT_BINARY if original.startswith(b"bplist") else plistlib.FMT_XML
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                mode="wb", dir=os.path.dirname(info_plist), delete=False) as fh:
+            temp_path = fh.name
+            plistlib.dump(info, fh, fmt=plist_format, sort_keys=False)
+        os.chmod(temp_path, stat.S_IMODE(os.stat(info_plist).st_mode))
+        os.replace(temp_path, info_plist)
+    except OSError as exc:
+        if temp_path and os.path.exists(temp_path):
+            os.unlink(temp_path)
+        _die(f"无法更新 Info.plist: {exc}")
+    print("    ElectronAsarIntegrity 已更新。")
+
+
+def _sanitize_macos_entitlements(entitlements):
+    sanitized = {
+        key: value
+        for key, value in entitlements.items()
+        if key.startswith("com.apple.security.")
+        and key != "com.apple.security.application-groups"
+    }
+    # The outer ad-hoc signature has no Team ID, while nested vendor frameworks
+    # retain OpenAI's signature. Allow those unchanged frameworks to load.
+    sanitized["com.apple.security.cs.disable-library-validation"] = True
+    return sanitized
+
+
+def _macos_adhoc_entitlements(app_path):
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                mode="wb", suffix=".plist", delete=False) as fh:
+            temp_path = fh.name
+        rc, output = run_cmd([
+            "codesign", "-d", "--xml", "--entitlements", temp_path, app_path,
+        ], capture=True)
+        if rc != 0:
+            os.unlink(temp_path)
+            temp_path = None
+            _die(f"无法读取 macOS app entitlements: {output}")
+        with open(temp_path, "rb") as fh:
+            entitlements = plistlib.load(fh)
+        if not isinstance(entitlements, dict):
+            raise plistlib.InvalidFileException("entitlements 不是字典")
+        entitlements = _sanitize_macos_entitlements(entitlements)
+        with open(temp_path, "wb") as fh:
+            plistlib.dump(entitlements, fh, sort_keys=False)
+        return temp_path
+    except (OSError, plistlib.InvalidFileException) as exc:
+        if temp_path and os.path.exists(temp_path):
+            os.unlink(temp_path)
+        _die(f"无法准备 macOS ad-hoc entitlements: {exc}")
 
 
 # ================================================================
 # 步骤 7: 平台收尾
 # ================================================================
 def step_finish_macos(app_path):
-    # 仅对 patched 副本做 ad-hoc 签名(修改 app.asar 后原签名失效，需重签才能启动)。
-    # 副本只用于 fast/plugins，不需要 TCC 权限，ad-hoc 足够；官方 app 不在此处理。
-    print("[7] 重新签名 (macOS 副本)...")
-    if not DRY_RUN:
-        run_cmd(["codesign", "--force", "--deep", "--sign", "-", app_path])
-    print("    签名完成。")
+    print("[7] 重新签名并验证 (macOS 副本)...")
+    if DRY_RUN:
+        print("    [DRY-RUN] 跳过签名")
+        return
+
+    rc, output = run_cmd(
+        ["xattr", "-dr", "com.apple.quarantine", app_path], capture=True)
+    if rc != 0:
+        _die(f"无法移除补丁副本的 quarantine 属性: {output}")
+
+    entitlements_path = _macos_adhoc_entitlements(app_path)
+    try:
+        rc, output = run_cmd([
+            "codesign", "--force", "--sign", "-",
+            "--preserve-metadata=identifier,flags,runtime",
+            "--entitlements", entitlements_path,
+            app_path,
+        ], capture=True)
+        if rc != 0:
+            _die(f"macOS 签名失败: {output}")
+    finally:
+        if os.path.exists(entitlements_path):
+            os.unlink(entitlements_path)
+
+    rc, output = run_cmd([
+        "codesign", "--verify", "--deep", "--strict", "--verbose=2", app_path,
+    ], capture=True)
+    if rc != 0:
+        _die(f"macOS 签名验证失败: {output}")
+    print("    签名完成并通过严格验证。")
 
 
 def step_shortcut_windows(exe_path, work_dir):
@@ -1035,8 +1694,13 @@ print("  ChatGPT Codex API Key 全功能解锁")
 print("==========================================")
 print()
 
+if (args.app or args.output) and not IS_MACOS:
+    _die("--app/--output 仅支持 macOS。")
+
 if args.assets:
     # ── 仅重新打 JS 补丁（调试 / 重新适配新版本）──────────────────
+    if args.app or args.output:
+        _die("--assets 不能与 --app/--output 同时使用。")
     print(f"[手动模式] 仅执行 JS 补丁，目录: {args.assets}")
     if not os.path.isdir(args.assets):
         _die(f"目录不存在: {args.assets}")
@@ -1045,12 +1709,19 @@ if args.assets:
 else:
     # ── 完整流程 ────────────────────────────────────────────────
     source_root, resources_dir, exe_path, is_store = step_detect()
-    step_kill_codex(exe_path)
+    macos_kill_paths = ()
+    if IS_MACOS:
+        macos_kill_paths = (
+            source_root,
+            _macos_patched_path(source_root, args.output),
+        )
+    step_kill_codex(exe_path, macos_kill_paths)
 
     if IS_MACOS:
         # 复制官方 app 到独立副本，补丁/签名只作用于副本，
-        # 官方 app 保持 OpenAI 签名供 Appshots/Computer Use 使用。
-        work_root, resources_dir, exe_path = step_copy_macos(source_root)
+        # 官方 app 保持 OpenAI 签名，作为 Appshots/原始 TCC 身份回退。
+        work_root, resources_dir, exe_path = step_copy_macos(
+            source_root, args.output)
     elif IS_WINDOWS and is_store:
         patch_root, resources_dir, exe_path = step_copy_store(source_root)
         work_root = patch_root
@@ -1066,17 +1737,20 @@ else:
         if not os.path.isdir(assets):
             _die(f"assets 目录不存在: {assets}")
         step_patch_js(assets)
+        _require_successful_js_patch()
 
     # 关键: 将打好补丁的 app/ 重新打包回 app.asar
     # (owl 运行时只从 app.asar 加载，不支持 app/ 文件夹回退)
     step_repack_asar(resources_dir)
 
-    step_fuses(exe_path)
-
     if IS_MACOS:
+        # 保持 Owl/Electron 的 ASAR 完整性元数据，不修改体积巨大的运行时框架。
+        step_update_macos_asar_integrity(work_root)
         step_finish_macos(work_root)
-    elif IS_WINDOWS and is_store:
-        step_shortcut_windows(exe_path, work_root)
+    else:
+        step_fuses(exe_path)
+        if IS_WINDOWS and is_store:
+            step_shortcut_windows(exe_path, work_root)
 
 # ================================================================
 # 汇总报告
@@ -1120,6 +1794,6 @@ elif not args.assets:
         print(f"  补丁完成！直接启动 {os.path.basename(exe_path)} 即可。")
     elif IS_MACOS:
         print(f"  补丁完成！启动打补丁的副本: {work_root}")
-        print(f"  官方 {source_root} 保持不变，Appshots/Computer Use 仍可正常使用。")
-        print("  (副本用于 API key 功能，官方版用于 Appshots/Computer Use)")
+        print(f"  官方 {source_root} 保持不变，可用于原始签名/TCC 回退。")
+        print("  Computer Use 权限项在系统设置中显示为 'Codex Computer Use'。")
 print()
