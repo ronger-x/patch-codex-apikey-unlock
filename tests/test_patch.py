@@ -25,6 +25,12 @@ def write_supported_assets(assets):
     native_plugins = assets / "use-plugins-test.js"
     desktop_features = assets / "desktop-feature-availability-test.js"
     desktop_feature_sync = assets / "desktop-feature-sync-test.js"
+    auth_context = assets / "auth-context-test.js"
+
+    (assets / "package.json").write_text('{"type":"module"}', encoding="utf-8")
+    auth_context.write_text(
+        "export const c={current:{authMethod:null}};", encoding="utf-8"
+    )
 
     service_tier.write_text(
         "let auth=getAuth(),gate=auth?.authMethod===`chatgpt`,"
@@ -83,17 +89,34 @@ def write_supported_assets(assets):
     )
     native_plugins.write_text(native_plugin_source, encoding="utf-8")
     desktop_features.write_text(
-        "function auth(){return(0,React.useContext)(AuthContext)?.authMethod"
+        "import{c as x}from\"./auth-context-test.js\";"
+        "const React={useContext:context=>context.current};"
+        "let statsigEnabled=false;"
+        "function statsig(){return statsigEnabled}"
+        "function resolve(value){return value}"
+        "function auth(){return(0,React.useContext)(x)?.authMethod"
         "===`chatgpt`}"
         "function computer(host){let gate=statsig(`1506311413`),config;"
         "config={featureName:`computer_use`,hostId:host};"
-        "return resolve({feature:config,isComputerUseGateEnabled:gate})}"
+        "let x=`loading`;"
+        "return resolve({feature:config,isComputerUseGateEnabled:gate,shadow:x})}"
         "function external(host){let gate=statsig(`410065390`),config;"
         "config={featureName:`browser_use_external`,hostId:host};"
         "return resolve({feature:config,isExternalBrowserUseGateEnabled:gate})}"
         "function browser(host){let gate=statsig(`410262010`),config;"
         "config={featureName:`browser_use`,hostId:host};"
-        "return resolve({feature:config,isBrowserAgentGateEnabled:gate})}",
+        "return resolve({feature:config,isBrowserAgentGateEnabled:gate})}"
+        "function run(method,enabled){x.current={authMethod:method};"
+        "statsigEnabled=enabled;return["
+        "computer(`host`).isComputerUseGateEnabled,"
+        "external(`host`).isExternalBrowserUseGateEnabled,"
+        "browser(`host`).isBrowserAgentGateEnabled]}"
+        "if(process.argv[2]===`--verify`){console.log(JSON.stringify({"
+        "apikeyFalse:run(`apikey`,false),"
+        "chatgptFalse:run(`chatgpt`,false),"
+        "copilotFalse:run(`copilot`,false),"
+        "bedrockFalse:run(`amazonBedrock`,false),"
+        "chatgptTrue:run(`chatgpt`,true)}))}",
         encoding="utf-8",
     )
     desktop_feature_sync.write_text(
@@ -112,6 +135,7 @@ def write_supported_assets(assets):
         "native_plugin_source": native_plugin_source,
         "desktop_features": desktop_features,
         "desktop_feature_sync": desktop_feature_sync,
+        "auth_context": auth_context,
     }
 
 
@@ -143,6 +167,9 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
             desktop_features = fixture["desktop_features"]
             desktop_feature_sync = fixture["desktop_feature_sync"]
             model_filter_source = fixture["model_filter_source"]
+            desktop_features.write_text(
+                desktop_features.read_text("utf-8") + ";(0)", encoding="utf-8"
+            )
 
             first = self.run_patch(assets)
             self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
@@ -208,19 +235,33 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
 
             feature_content = desktop_features.read_text("utf-8")
             self.assertIn(
-                "gate=[statsig(`1506311413`),(0,React.useContext)(AuthContext)"
-                "?.authMethod===`apikey`].some(Boolean)",
+                "function useCodexApiKeyAuth(){return(0,React.useContext)(x)"
+                "?.authMethod===`apikey`}",
                 feature_content,
             )
             self.assertIn(
-                "gate=[statsig(`410065390`),(0,React.useContext)(AuthContext)"
-                "?.authMethod===`apikey`].some(Boolean)",
+                ";(0);\nfunction useCodexApiKeyAuth()", feature_content
+            )
+            self.assertIn(
+                "gate=[statsig(`1506311413`),useCodexApiKeyAuth()]"
+                ".some(Boolean)",
                 feature_content,
             )
             self.assertIn(
-                "gate=[statsig(`410262010`),(0,React.useContext)(AuthContext)"
-                "?.authMethod===`apikey`].some(Boolean)",
+                "gate=[statsig(`410065390`),useCodexApiKeyAuth()]"
+                ".some(Boolean)",
                 feature_content,
+            )
+            self.assertIn(
+                "gate=[statsig(`410262010`),useCodexApiKeyAuth()]"
+                ".some(Boolean)",
+                feature_content,
+            )
+            self.assertEqual(
+                feature_content.count(
+                    "(0,React.useContext)(x)?.authMethod===`apikey`"
+                ),
+                1,
             )
             self.assertIn(
                 "nodeGate=[statsig(`2212532336`),useAuth()?.authMethod==="
@@ -230,6 +271,27 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
             self.assertNotIn("true||statsig", feature_content)
             self.assertIn("featureName:`computer_use`", feature_content)
             self.assertIn("featureName:`browser_use`", feature_content)
+
+            desktop_result = subprocess.run(
+                [node, str(desktop_features), "--verify"],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            self.assertEqual(
+                desktop_result.returncode,
+                0,
+                desktop_result.stdout + desktop_result.stderr,
+            )
+            desktop_output = json.loads(desktop_result.stdout)
+            self.assertEqual(desktop_output["apikeyFalse"], [True, True, True])
+            self.assertEqual(desktop_output["chatgptFalse"], [False, False, False])
+            self.assertEqual(desktop_output["copilotFalse"], [False, False, False])
+            self.assertEqual(desktop_output["bedrockFalse"], [False, False, False])
+            self.assertEqual(desktop_output["chatgptTrue"], [True, True, True])
 
             contents_after_first_run = {
                 path.name: path.read_text("utf-8") for path in assets.glob("*.js")
@@ -369,6 +431,104 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
             self.assertNotEqual(asi_result.returncode, 0)
             self.assertNotIn("新版已原生支持 API key", asi_result.stdout)
             self.assertEqual(asi_source, native_plugins.read_text("utf-8"))
+
+    def test_desktop_gate_patch_migrates_shadowing_pr5_form(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets = Path(tmp)
+            fixture = write_supported_assets(assets)
+            desktop_features = fixture["desktop_features"]
+            legacy = desktop_features.read_text("utf-8").replace(
+                "let statsigEnabled=false;",
+                "const useCodexApiKeyAuth=0;let statsigEnabled=false;",
+            )
+            for gate_id in ("1506311413", "410065390", "410262010"):
+                legacy = legacy.replace(
+                    f"gate=statsig(`{gate_id}`)",
+                    f"gate=[statsig(`{gate_id}`),(0,React.useContext)(x)"
+                    "?.authMethod===`apikey`].some(Boolean)",
+                )
+            desktop_features.write_text(legacy, encoding="utf-8")
+
+            result = self.run_patch(assets)
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertNotIn("[FAIL]", result.stdout)
+            patched = desktop_features.read_text("utf-8")
+            self.assertIn(
+                "function useCodexApiKeyAuth2(){return(0,React.useContext)(x)"
+                "?.authMethod===`apikey`}",
+                patched,
+            )
+            self.assertEqual(patched.count("useCodexApiKeyAuth2()].some(Boolean)"), 3)
+            self.assertEqual(
+                patched.count("(0,React.useContext)(x)?.authMethod===`apikey`"),
+                1,
+            )
+
+            node = shutil.which("node")
+            if node is None:
+                self.fail("Node.js is required for desktop-gate semantic tests")
+            semantic_result = subprocess.run(
+                [node, str(desktop_features), "--verify"],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            self.assertEqual(
+                semantic_result.returncode,
+                0,
+                semantic_result.stdout + semantic_result.stderr,
+            )
+            semantic_output = json.loads(semantic_result.stdout)
+            self.assertEqual(semantic_output["apikeyFalse"], [True, True, True])
+            self.assertEqual(semantic_output["chatgptFalse"], [False, False, False])
+
+            migrated_content = desktop_features.read_text("utf-8")
+            second = self.run_patch(assets)
+            self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+            self.assertIn("[SKIP] Computer Use 可用性", second.stdout)
+            self.assertEqual(migrated_content, desktop_features.read_text("utf-8"))
+
+    def test_windows_taskbar_identity_is_unique_idempotent_and_fails_closed(self):
+        with loaded_patch_module() as patch_module, tempfile.TemporaryDirectory() as tmp:
+            main_build = Path(tmp) / ".vite" / "build"
+            main_build.mkdir(parents=True)
+            identity_file = main_build / "file-based-logger-test.js"
+            original = (
+                "var flavors={Prod:`prod`};"
+                "function appId(flavor){switch(flavor){"
+                "case flavors.Dev:return`com.openai.codex.dev`;"
+                "case flavors.Prod:return`com.openai.codex`}}"
+            )
+            identity_file.write_text(original, encoding="utf-8")
+            patch_module.DRY_RUN = False
+            patch_module.results = {"applied": [], "skipped": [], "failed": []}
+
+            patch_module.apply_windows_app_user_model_id_patch(str(main_build))
+
+            patched = identity_file.read_text("utf-8")
+            self.assertIn(
+                "case flavors.Prod:return`com.openai.codex.patched`", patched
+            )
+            self.assertEqual([], patch_module.results["failed"])
+            self.assertEqual(1, len(patch_module.results["applied"]))
+
+            patch_module.results = {"applied": [], "skipped": [], "failed": []}
+            patch_module.apply_windows_app_user_model_id_patch(str(main_build))
+            self.assertEqual(patched, identity_file.read_text("utf-8"))
+            self.assertEqual(1, len(patch_module.results["skipped"]))
+
+            drifted = original.replace(
+                "return`com.openai.codex`", "return`com.openai.codex.store`"
+            )
+            identity_file.write_text(drifted, encoding="utf-8")
+            patch_module.results = {"applied": [], "skipped": [], "failed": []}
+            patch_module.apply_windows_app_user_model_id_patch(str(main_build))
+            self.assertEqual(drifted, identity_file.read_text("utf-8"))
+            self.assertEqual(1, len(patch_module.results["failed"]))
 
     def test_current_desktop_feature_marker_drift_fails_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -518,8 +678,8 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
                 copied,
                 (
                     patched_app,
-                    f"{patched_app}/Contents/Resources",
-                    f"{patched_app}/Contents/MacOS/ChatGPT",
+                    str(Path(patched_app) / "Contents" / "Resources"),
+                    str(Path(patched_app) / "Contents" / "MacOS" / "ChatGPT"),
                 ),
             )
 
