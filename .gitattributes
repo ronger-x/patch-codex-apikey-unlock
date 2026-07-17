@@ -1,0 +1,3 @@
+* text=auto eol=lf
+*.md text working-tree-encoding=UTF-8 eol=lf
+*.py text working-tree-encoding=UTF-8 eol=lf
