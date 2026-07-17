@@ -1,270 +1,271 @@
 ---
 name: patch-codex-apikey-unlock
 description: |
-  Patch ChatGPT Codex (macOS/Windows) - API Key 模式功能解锁。
-  兼容 ChatGPT/Codex 双品牌名称，显示 app-server 返回的最新隐藏模型，
-  展示模型声明但被实验配置隐藏的思考强度，并解除 Fast/Speed、Browser 与
-  Computer Use 的 API key 门控。
+  Patch ChatGPT Codex (macOS/Windows) to unlock features in API key mode.
+  Support both ChatGPT and Codex branding, show the latest hidden models
+  returned by app-server, expose reasoning effort levels declared by models
+  but hidden by experiment configuration, and remove API key gates from
+  Fast/Speed, Browser, and Computer Use.
 version: 4.4.0
 ---
 
-# Patch ChatGPT Codex - API Key 模式功能解锁
+# Patch ChatGPT Codex - Unlock API Key Mode Features
 
-## 方案概述
+## Overview
 
-使用 API key 模式时，解除桌面端仍依赖 ChatGPT 登录上下文的前端门控。
+Remove desktop UI gates that still depend on ChatGPT sign-in context when using API key mode.
 
-已验证 Windows Store `26.707.3748.0` 和 macOS app `26.707.31428`（Apple Silicon）。显示名与主入口已变为 ChatGPT，但包名/目录仍可能使用 Codex；脚本分别读取 MSIX manifest 或 macOS `Info.plist`，并保留旧名称回退。
+Verified with Windows Store version `26.707.3748.0` and macOS app version `26.707.31428` (Apple Silicon). The display name and main entry point have changed to ChatGPT, but package names and directories may still use Codex. The script reads the MSIX manifest or macOS `Info.plist` as appropriate and retains fallback support for the old name.
 
-### 解锁功能清单
+### Unlocked Features
 
-| # | 功能 | 原始限制 | 补丁方式 |
-|---|------|----------|----------|
-| 1 | 最新模型列表 | API key 无 ChatGPT hidden-model 白名单 | 展示 app-server 已返回的全部模型 |
-| 2 | 隐藏思考强度选项 | API key 无 ChatGPT 实验上下文 | 展示模型在 `supportedReasoningEfforts` 中实际声明的全部选项 |
-| 3 | Fast/Speed UI | `authMethod !== 'chatgpt'` 时隐藏 | 放开服务层级选择器 |
-| 4 | Fast 请求层级 | 发请求前再次限定 `chatgpt` | 将 `apikey` 加入允许列表 |
-| 5 | Plugins | 旧版限制非 ChatGPT；新版已原生支持 API key | 旧版补丁 / 新版自动跳过 |
-| 6 | Browser / Chrome | API key 无 Statsig 用户上下文 | 开启桌面 gate，保留平台与 app-server 能力检查 |
-| 7 | Computer Use | 可用性与 Node runtime 受 Statsig gate 限制 | 开启两个 gate，保留原生服务认证与 TCC 检查 |
-| 8 | 语音输入/听写 | 仅 chatgpt 模式 | 扩展为 `chatgpt \|\| apikey` |
-| 9 | 用量/计费设置 | 仅 chatgpt 模式 | 扩展为 `chatgpt \|\| apikey` |
-| 10 | i18n 多语言 | API key 无 Statsig 用户上下文 | 强制启用 |
+| # | Feature | Original restriction | Patch method |
+|---|---------|----------------------|--------------|
+| 1 | Latest model list | API key mode has no ChatGPT hidden-model allowlist | Show every model returned by app-server |
+| 2 | Hidden reasoning effort options | API key mode has no ChatGPT experiment context | Show every option the model declares in `supportedReasoningEfforts` |
+| 3 | Fast/Speed UI | Hidden when `authMethod !== 'chatgpt'` | Enable the service tier selector |
+| 4 | Fast request tier | Restricted to `chatgpt` again before sending a request | Add `apikey` to the allowlist |
+| 5 | Plugins | Older versions restrict non-ChatGPT sessions; newer versions support API key mode natively | Patch older versions; skip automatically on newer versions |
+| 6 | Browser / Chrome | API key mode has no Statsig user context | Enable the desktop gate while retaining platform and app-server capability checks |
+| 7 | Computer Use | Availability and the Node runtime are restricted by Statsig gates | Enable both gates while retaining native service authentication and TCC checks |
+| 8 | Voice input/dictation | ChatGPT mode only | Expand to `chatgpt \|\| apikey` |
+| 9 | Usage/billing settings | ChatGPT mode only | Expand to `chatgpt \|\| apikey` |
+| 10 | i18n localization | API key mode has no Statsig user context | Force enablement |
 
-## 前置要求
+## Prerequisites
 
 - Python 3
-- Node.js（脚本固定使用 `@electron/asar@3.4.1` / `@electron/fuses@1.8.0`，避免最新版强制要求 Node 22.12+）
+- Node.js (the script pins `@electron/asar@3.4.1` and `@electron/fuses@1.8.0` to avoid the Node 22.12+ requirement in newer releases)
 
-## 一键使用（推荐）
+## Quick Start (Recommended)
 
 ```bash
-# macOS / Windows，路径自动检测
+# macOS / Windows; paths are detected automatically
 python3 patch.py
 
-# 仅检查/调试 JS 补丁（不重新打包 app.asar）
+# Check/debug only the JS patches without repacking app.asar
 python3 patch.py --assets /path/to/webview/assets
 
-# 预演，不写入任何文件
+# Dry run without writing any files
 python3 patch.py --dry-run
 ```
 
-`patch.py` 自动完成所有步骤：关闭进程 → 检测安装类型 → 创建独立副本 → 提取/重打包 asar → 打 JS 补丁 → Windows fuse/快捷方式处理或 macOS ASAR 完整性更新与签名。
+`patch.py` performs every step automatically: stop processes -> detect the installation type -> create an independent copy -> extract/repack ASAR -> apply JS patches -> handle Windows fuses/shortcuts or update macOS ASAR integrity and signatures.
 
 ## macOS
 
-脚本按顺序检测 `/Applications` 和 `~/Applications` 中的 `ChatGPT.app` / `Codex.app`，读取 `Info.plist` 的真实可执行文件，并要求 Resources 中存在 Codex 运行时标记。官方 app 不会被修改；补丁写入同级目录，同级不可写时回退到 `~/Applications`。新品牌副本名为 `ChatGPT-Codex-Patched.app`，旧品牌为 `Codex-Patched.app`。
+The script checks `/Applications` and `~/Applications` in order for `ChatGPT.app` / `Codex.app`, reads the actual executable from `Info.plist`, and requires a Codex runtime marker in Resources. The official app is never modified. The patched copy is written beside it, with fallback to `~/Applications` if that directory is not writable. The copy is named `ChatGPT-Codex-Patched.app` for the new brand and `Codex-Patched.app` for the old brand.
 
-### 一键补丁
+### One-Command Patch
 
 ```bash
 python3 patch.py
 
-# 自定义安装与输出路径
+# Custom installation and output paths
 python3 patch.py --app /path/to/Codex.app \
   --output "$HOME/Applications/ChatGPT-Codex-Patched.app"
 ```
 
-完成时脚本会刷新 `Info.plist` 中的 `ElectronAsarIntegrity` header hash，只对最外层 app 做 ad-hoc 签名，并严格验证整个 bundle。签名会移除仅对 OpenAI Team ID 有效的 application-group/keychain entitlements，保留 JIT、音频、相机、网络和自动化等运行权限；内部 OpenAI 签名的 framework/helper 不会被改写。为加载这些异签名内部组件，外层 entitlement 会禁用 library validation，这会降低外层进程的动态库注入防护，因此该处理只用于独立副本。
+On completion, the script refreshes the `ElectronAsarIntegrity` header hash in `Info.plist`, applies an ad-hoc signature only to the outermost app, and strictly verifies the entire bundle. Signing removes application-group/keychain entitlements that are valid only for the OpenAI Team ID while preserving runtime permissions for JIT, audio, camera, networking, automation, and similar features. Internally bundled frameworks/helpers carrying OpenAI signatures are not rewritten. To load these components with different signatures, the outer entitlement disables library validation. This weakens dynamic-library injection protection for the outer process, so this treatment is used only for the independent copy.
 
-### Browser 与 Computer Use
+### Browser and Computer Use
 
-Browser/Chrome/Computer Use 的 bundled plugins 由 renderer 计算出的 desktop availability 决定。API key 会话缺少 ChatGPT Statsig 用户上下文时，原版会记录 `reason=statsig-disabled` 并把插件从运行时市场移除。补丁按 `featureName` 与 availability 字段定位三个 gate，不把 Statsig 数字 ID 或模型名当作补丁语义；平台、WSL、app-server experimental feature 与插件配置检查仍由原逻辑执行。Computer Use 的 Node runtime gate 单独处理。
+Renderer-computed desktop availability determines whether the bundled Browser/Chrome/Computer Use plugins are enabled. When an API key session lacks ChatGPT Statsig user context, the original app records `reason=statsig-disabled` and removes the plugins from the runtime marketplace. The patch locates the three gates by `featureName` and availability fields; it does not treat numeric Statsig IDs or model names as patch semantics. The original logic still performs platform, WSL, app-server experimental feature, and plugin configuration checks. The Computer Use Node runtime gate is handled separately.
 
-macOS Computer Use 使用 OpenAI 原签名的 `Codex Computer Use.app`，bundle id 为 `com.openai.sky.CUAService`。系统设置中的权限名称是 **Codex Computer Use**，需同时检查“辅助功能”与“屏幕与系统音频录制”（旧系统名为“屏幕录制”），而不是查找 ChatGPT。其 service、client、`codex`、`node_repl` 和 Node runtime 均保持 OpenAI 签名。
+On macOS, Computer Use runs the OpenAI-signed `Codex Computer Use.app` with bundle ID `com.openai.sky.CUAService`. In System Settings, the permission entry is named **Codex Computer Use**. Check both "Accessibility" and "Screen & System Audio Recording" (named "Screen Recording" on older systems), rather than looking for ChatGPT. Its service, client, `codex`, `node_repl`, and Node runtime all retain their OpenAI signatures.
 
-最外层补丁副本必须 ad-hoc 签名。Browser native addon 在 macOS responsible-process 归因到该外层进程时会返回 `missing-code-signing-identity`。补丁仅将这一结果降级为允许，继续拒绝 `untrusted-code-signing-identity` 与 `missing-socket-file-descriptor`，并把 Browser socket chmod 为 owner-only `0600`；不修改 `.node` 原生模块。安全代价是同一用户下缺少签名身份的进程仍会失去一部分隔离。官方 app 保持不变，作为 Appshots 与原始主 app TCC 身份的回退。
+The outer patched copy must carry an ad-hoc signature. When the macOS responsible-process check attributes the Browser native addon to this outer process, it returns `missing-code-signing-identity`. The patch downgrades only this result to allowed, continues to reject `untrusted-code-signing-identity` and `missing-socket-file-descriptor`, and sets the Browser socket to owner-only mode `0600`; it does not modify native `.node` modules. The security tradeoff is that unsigned processes running as the same user lose some isolation. The official app remains unchanged as a fallback for Appshots and the TCC identity of the original main app.
 
-### 回滚
+### Rollback
 
 ```bash
 rm -rf /Applications/ChatGPT-Codex-Patched.app
 rm -rf "$HOME/Applications/ChatGPT-Codex-Patched.app"
-# 旧品牌版本：rm -rf /Applications/Codex-Patched.app
+# Old brand: rm -rf /Applications/Codex-Patched.app
 ```
 
-官方 app 保持原签名，可直接继续使用。
+The official app retains its original signature and remains directly usable.
 
 
 ---
 
 ## Windows
 
-### 回滚方法
+### Rollback
 
-**Store 版（MSIX，ChatGPT 品牌）：**
+**Store version (MSIX, ChatGPT brand):**
 ```powershell
-# 直接删除补丁目录，原 Store 版未动
+# Delete the patched directory directly; the original Store version is unchanged
 Remove-Item -Recurse -Force "$env:LOCALAPPDATA\Programs\ChatGPT-Codex-Patched"
 ```
 
-**传统安装版：**
+**Traditional installer:**
 ```powershell
 cd "$env:LOCALAPPDATA\Programs\Codex\resources"
 Remove-Item -Recurse -Force app -ErrorAction SilentlyContinue
 if (Test-Path app.asar1) { Rename-Item app.asar1 app.asar }
 if (Test-Path app.asar.bak) { Copy-Item app.asar.bak app.asar }
-Write-Host "已回滚到原始版本"
+Write-Host "Rolled back to the original version"
 ```
 
-### 一键补丁（Windows）
+### One-Command Patch (Windows)
 
 ```powershell
 python3 patch.py
 ```
 
-> 自动检测 Microsoft Store 版（MSIX）和传统安装版。MSIX 入口从 `AppxManifest.xml` 读取，并验证 Codex 资源标记。
-> ChatGPT 品牌的 Store 版复制到 `%LOCALAPPDATA%\Programs\ChatGPT-Codex-Patched`（原版不动），桌面快捷方式为 `ChatGPT Codex (Patched)`。
+> Automatically detect the Microsoft Store version (MSIX) or traditional installation. Read the MSIX entry point from `AppxManifest.xml` and verify the Codex resource marker.
+> Copy the ChatGPT-branded Store version to `%LOCALAPPDATA%\Programs\ChatGPT-Codex-Patched` without modifying the original, and create the desktop shortcut `ChatGPT Codex (Patched)`.
 
 ---
 
 ## config.toml
 
-保留现有 API provider 配置。补丁不写死模型 ID、推理强度或旧版 `features.enable_fast`：模型和推理强度来自 app-server 的 `model/list`（请求已带 `includeHidden: true`），只展示模型在 `supportedReasoningEfforts` 中实际声明的选项，Fast 选择使用当前版本的 `service_tier`。
+Preserve the existing API provider configuration. The patch does not hard-code model IDs, reasoning effort levels, or the legacy `features.enable_fast` setting. Models and reasoning effort levels come from the app-server `model/list` response (requested with `includeHidden: true`), and only the options that each model actually declares in `supportedReasoningEfforts` are shown. Fast selection uses the current version's `service_tier`.
 
 ---
 
-## 版本更新排查指南
+## Troubleshooting Version Updates
 
-ChatGPT Codex 更新后 JS 文件名（hash 后缀）和变量名都可能变化。以下是每个补丁的定位方法：
+After ChatGPT Codex updates, both JS filenames (hash suffixes) and variable names may change. Use the following methods to locate each patch target.
 
-### 通用搜索策略
+### General Search Strategy
 
 ```bash
-# 用 --assets 参数只检查/打 JS 补丁
+# Use --assets to check/apply only the JS patches
 python3 patch.py --assets /Applications/ChatGPT-Codex-Patched.app/Contents/Resources/app/webview/assets
-# Windows (Store 版)
+# Windows (Store version)
 python3 patch.py --assets "$env:LOCALAPPDATA\Programs\ChatGPT-Codex-Patched\resources\app\webview\assets"
 
-# 手动搜索（macOS）
+# Manual search (macOS)
 cd /Applications/ChatGPT-Codex-Patched.app/Contents/Resources/app/webview/assets
 ```
 
-### 1. 最新模型列表
+### 1. Latest Model List
 
 ```bash
 grep -rl "useHiddenModels" *.js
-# 26.707 的目标文件为 model-list-filter-*.js。
-# 原条件：if(useAllowlist?allowed.has(model.model):!model.hidden)
-# 新条件仅对 API key 放开：
+# In version 26.707, the target is model-list-filter-*.js.
+# Original condition: if(useAllowlist?allowed.has(model.model):!model.hidden)
+# New condition applies only to API key mode:
 # if(authMethod===`apikey`||(useAllowlist?allowed.has(model.model):!model.hidden))
 ```
 
-### 2. 隐藏思考强度选项
+### 2. Hidden Reasoning Effort Options
 
 ```bash
 grep -rl "enabledReasoningEfforts" *.js
-# 同一 model-list-filter-*.js 中有两层过滤：
-# 1. includeUltraReasoningEffort 为 false 时移除 ultra
-# 2. enabledReasoningEfforts.has(effort) 隐藏未启用档位
-# API key 模式绕过这两层，但继续保留合法枚举校验；
-# 不硬编码档位，只展示每个模型的 supportedReasoningEfforts。
+# There are two filtering layers in the same model-list-filter-*.js:
+# 1. Remove ultra when includeUltraReasoningEffort is false
+# 2. Hide disabled levels with enabledReasoningEfforts.has(effort)
+# API key mode bypasses both layers but retains validation against legal enum values.
+# Do not hard-code effort levels; show each model's supportedReasoningEfforts.
 ```
 
-API key 模式的完整列表显示在 Advanced/Effort 菜单；Max、Ultra 等选项仅在
-当前模型实际声明支持时出现。简化 Power 滑杆使用官方固定组合，不在此补丁中修改。
+The full API key mode list appears in the Advanced/Effort menu. Options such as Max and Ultra appear only when the current model actually declares support. The simplified Power slider uses fixed combinations from the official app and is not modified by this patch.
 
-### 3. Fast UI / 服务层级门控
+### 3. Fast UI / Service Tier Gate
 
 ```bash
 grep -rl "isServiceTierAllowed" *.js
-# use-service-tier-settings-*.js 中：
+# In use-service-tier-settings-*.js:
 # allowed=auth?.authMethod===`chatgpt`,method=auth?.authMethod??null
-# 将 allowed 改为：
+# Change allowed to:
 # auth?.authMethod===`apikey`||auth?.authMethod===`chatgpt`
 ```
 
-### 4. Fast 实际请求门控
+### 4. Fast Request Gate
 
 ```bash
 grep -rl "Failed to read service tier for request" *.js
-# read-service-tier-for-request-*.js 中：
+# In read-service-tier-for-request-*.js:
 # if(method!==`chatgpt`)return!1
-# 改为：if(method!==`chatgpt`&&method!==`apikey`)return!1
+# Change to: if(method!==`chatgpt`&&method!==`apikey`)return!1
 ```
 
 ### 5. Plugins
 
 ```bash
 grep -rl "useHiddenOpenAICuratedMarketplaces" *.js
-# 26.707 的 use-plugins-*.js 已包含：
+# Version 26.707 use-plugins-*.js already contains:
 # return method!==`chatgpt`&&method!==`apikey`&&...
-# 这表示 API key 已原生允许，脚本应报告 SKIP，而不是误改
-# plugin detail 页中仅用于展示原因的 connector-unavailable 文本。
+# This means API key mode is supported natively; the script should report SKIP
+# instead of applying an incorrect patch.
+# On the plugin detail page, connector-unavailable text is used only to explain the reason.
 ```
 
-旧版若仍有 `check-plugin-availability-*.js` 中的赋值门控，脚本继续使用 `false&&` 兼容补丁。该 UI 补丁不会伪造 `/aip/connectors` 所需的 ChatGPT 会话身份，因此不要把新版 ChatGPT 会话型连接器描述为 API key 原生可用。
+If an older version still has an assignment gate in `check-plugin-availability-*.js`, the script continues to apply the compatible `false&&` patch. This UI patch does not forge the ChatGPT session identity required by `/aip/connectors`, so do not describe newer ChatGPT session-based connectors as natively available with an API key.
 
 ### 6. Browser / Chrome
 
 ```bash
 grep -rl 'featureName:`browser_use`' *.js
-# 同一 desktop availability chunk 中应同时存在：
+# The same desktop availability chunk should contain both:
 # featureName:`browser_use`          + isBrowserAgentGateEnabled
 # featureName:`browser_use_external` + isExternalBrowserUseGateEnabled
-# 脚本沿 availability 字段反查其 Statsig 赋值，并让原 gate 与
-# authMethod === `apikey` 取 OR；两个 hook 始终都会执行。
-# 不依赖压缩变量名，也不把当前 Statsig ID 写成定位条件。
+# The script traces each availability field back to its Statsig assignment and ORs
+# the original gate with authMethod === `apikey`; both hooks always execute.
+# It does not depend on minified variable names or use the current Statsig ID as a locator.
 
-# macOS Browser native pipe 回退位于 webview 同级的 .vite/build/main-*.js：
+# The macOS Browser native pipe fallback is in .vite/build/main-*.js beside webview:
 grep -rl 'browser-use-peer-authorization.node' ../../.vite/build/main-*.js
-# 只允许 reason === `missing-code-signing-identity`；
-# `untrusted-code-signing-identity` 与缺失 socket fd 必须继续拒绝。
+# Allow only reason === `missing-code-signing-identity`.
+# Continue to reject `untrusted-code-signing-identity` and a missing socket fd.
 ```
 
 ### 7. Computer Use
 
 ```bash
 grep -rl 'featureName:`computer_use`' *.js
-# desktop availability 中定位 isComputerUseGateEnabled 对应的 Statsig 赋值。
+# In desktop availability, locate the Statsig assignment for isComputerUseGateEnabled.
 
 grep -rl 'computerUseNodeRepl' *.js
-# 同步给主进程的 computerUseNodeRepl 字段还有一个独立 runtime gate；
-# 脚本让原 gate 与 API key 取 OR，不绕过 computer.available，
-# 其他认证模式仍使用原 gate。
+# The computerUseNodeRepl field synchronized to the main process has a separate runtime gate.
+# The script ORs the original gate with API key mode without bypassing computer.available.
+# Other authentication modes continue to use the original gate.
 ```
 
-运行时验证时，marketplace 应包含 `computer-use`，并由保持 OpenAI 签名的 `SkyComputerUseService` 创建 group-container socket。TCC 项名称为 `Codex Computer Use`。不要通过修改原生二进制或 `codesign --deep` 绕过服务认证。
+During runtime verification, the marketplace should contain `computer-use`, and the OpenAI-signed `SkyComputerUseService` should create the group-container socket. The TCC entry is named `Codex Computer Use`. Do not bypass service authentication by modifying native binaries or using `codesign --deep`.
 
-### 8. 语音输入
+### 8. Voice Input
 
 ```bash
 grep -rn "authMethod===.chatgpt." *.js | grep -v "!=="
-# 找到 xxx&&yyy.authMethod===`chatgpt` 且在 annotation/comment/editor 相关文件中
-# 扩展为 xxx&&(yyy.authMethod===`chatgpt`||yyy.authMethod===`apikey`)
+# Find xxx&&yyy.authMethod===`chatgpt` in annotation/comment/editor-related files.
+# Expand to xxx&&(yyy.authMethod===`chatgpt`||yyy.authMethod===`apikey`)
 ```
 
-### 9. 用量设置
+### 9. Usage Settings
 
 ```bash
 grep -rn "let.*===.chatgpt." *.js
-# 找到 let r=e===`chatgpt` 且在 usage-settings 相关文件中
-# 扩展为 let r=e===`chatgpt`||e===`apikey`
+# Find let r=e===`chatgpt` in usage-settings-related files.
+# Expand to let r=e===`chatgpt`||e===`apikey`
 ```
 
-### 10. i18n 多语言
+### 10. i18n Localization
 
 ```bash
 grep -rn "enable_i18n" *.js
-# 找到 xxx=(0,YYY.useMemo)(()=>nnn?.get(`enable_i18n`,!1),[nnn])
-# 改为 xxx=(0,YYY.useMemo)(()=>!0,[nnn])
-# 关键: Statsig 实验门控在无用户上下文时默认返回 false
+# Find xxx=(0,YYY.useMemo)(()=>nnn?.get(`enable_i18n`,!1),[nnn])
+# Change to xxx=(0,YYY.useMemo)(()=>!0,[nnn])
+# Key point: without user context, the Statsig experiment gate returns false by default.
 ```
 
-## 原理说明
+## How It Works
 
-| 操作 | 原因 | 位置 |
-|------|------|------|
-| 从 manifest/plist 读取入口 | ChatGPT 显示名、包身份和可执行文件名不再一致 | 安装发现 |
-| 提取后重新打包 `app.asar` | Owl 运行时不会回退加载松散的 `app/` 目录 | Resources 目录 |
-| 保留 `.node` / 原生模块 sidecar | Electron 必须从磁盘加载原生扩展 | `app.asar.unpacked` |
-| 更新 `ElectronAsarIntegrity` | 让重打包后的 ASAR header hash 与 `Info.plist` 一致 | `Info.plist` (仅 macOS) |
-| 外层 ad-hoc 签名 + 严格验证 | 允许修改后的副本启动，同时保留内部 OpenAI 签名 | 最终步骤 (仅 macOS) |
-| hidden-model 过滤绕过 | API key 没有 ChatGPT Statsig 模型白名单 | `model-list-filter-*` |
-| reasoning-effort 过滤绕过 | API key 无 ChatGPT 实验上下文，enabled 集合可能隐藏模型声明的选项 | `model-list-filter-*` |
-| 请求级服务层级放行 | 仅显示 Fast 选项不足以改变实际请求 | `read-service-tier-for-request-*` |
-| desktop availability gate | API key 无 Statsig 用户上下文时 bundled plugins 会被移除 | desktop feature chunk |
-| Computer Use runtime gate | 可用性成立后仍需选择 Node runtime | desktop feature sync chunk |
-| Browser 缺失签名身份回退 | ad-hoc 外层 app 使 responsible-process 身份无法完整解析 | `.vite/build/main-*` (仅 macOS) |
-| Statsig 实验绕过 | API key 模式无 Statsig 用户上下文，i18n/特性实验默认关闭 | webview JS |
-| `authMethod` 门控绕过 | 多处功能检查 `=== 'chatgpt'`，API key 模式被排除 | webview JS |
+| Operation | Reason | Location |
+|-----------|--------|----------|
+| Read the entry point from the manifest/plist | The ChatGPT display name, package identity, and executable name no longer match | Installation discovery |
+| Repack `app.asar` after extraction | The Owl runtime does not fall back to loading a loose `app/` directory | Resources directory |
+| Preserve `.node` / native module sidecars | Electron must load native extensions from disk | `app.asar.unpacked` |
+| Update `ElectronAsarIntegrity` | Match the repacked ASAR header hash to `Info.plist` | `Info.plist` (macOS only) |
+| Apply an outer ad-hoc signature and strict verification | Allow the modified copy to launch while preserving internal OpenAI signatures | Final step (macOS only) |
+| Bypass hidden-model filtering | API key mode has no ChatGPT Statsig model allowlist | `model-list-filter-*` |
+| Bypass reasoning-effort filtering | API key mode has no ChatGPT experiment context, so the enabled set may hide model-declared options | `model-list-filter-*` |
+| Allow request-level service tiers | Showing the Fast option alone does not change actual requests | `read-service-tier-for-request-*` |
+| Enable the desktop availability gate | Bundled plugins are removed when API key mode has no Statsig user context | Desktop feature chunk |
+| Enable the Computer Use runtime gate | A Node runtime must still be selected after availability is established | Desktop feature sync chunk |
+| Fall back when the Browser signing identity is missing | An ad-hoc outer app prevents complete responsible-process identity resolution | `.vite/build/main-*` (macOS only) |
+| Bypass Statsig experiments | API key mode has no Statsig user context, so i18n/feature experiments default to disabled | webview JS |
+| Bypass `authMethod` gates | Multiple features check `=== 'chatgpt'`, excluding API key mode | webview JS |

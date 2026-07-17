@@ -1,3 +1,5 @@
+# -*- coding: utf-8 -*-
+
 import contextlib
 import hashlib
 import importlib.util
@@ -175,7 +177,8 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
             self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
             self.assertNotIn("[FAIL]", first.stdout)
             self.assertIn(
-                "[SKIP] 品牌视觉/插件市场统一 (新版已原生支持 API key)",
+                "[SKIP] Branding/plugin marketplace compatibility "
+                "(Current build natively supports API keys)",
                 first.stdout,
             )
             self.assertEqual(native_plugin_source, native_plugins.read_text("utf-8"))
@@ -299,13 +302,13 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
             second = self.run_patch(assets)
             self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
             self.assertNotIn("[FAIL]", second.stdout)
-            self.assertIn("[SKIP] 服务层级授权门控", second.stdout)
-            self.assertIn("[SKIP] Fast 请求服务层级门控", second.stdout)
-            self.assertIn("[SKIP] 隐藏模型列表解锁", second.stdout)
-            self.assertIn("[SKIP] 推理强度列表解锁", second.stdout)
-            self.assertIn("[SKIP] 内置 Browser 可用性", second.stdout)
-            self.assertIn("[SKIP] 外部 Browser 可用性", second.stdout)
-            self.assertIn("[SKIP] Computer Use 可用性", second.stdout)
+            self.assertIn("[SKIP] Service tier authorization gate", second.stdout)
+            self.assertIn("[SKIP] Fast request service tier gate", second.stdout)
+            self.assertIn("[SKIP] Hidden model list unlock", second.stdout)
+            self.assertIn("[SKIP] Reasoning effort list unlock", second.stdout)
+            self.assertIn("[SKIP] Built-in Browser availability", second.stdout)
+            self.assertIn("[SKIP] External Browser availability", second.stdout)
+            self.assertIn("[SKIP] Computer Use availability", second.stdout)
             self.assertIn("[SKIP] Computer Use Node runtime", second.stdout)
             self.assertEqual(
                 contents_after_first_run,
@@ -323,8 +326,8 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
                 0,
                 upgrade_result.stdout + upgrade_result.stderr,
             )
-            self.assertIn("[SKIP] 隐藏模型列表解锁", upgrade_result.stdout)
-            self.assertIn("[OK]   推理强度列表解锁", upgrade_result.stdout)
+            self.assertIn("[SKIP] Hidden model list unlock", upgrade_result.stdout)
+            self.assertIn("[OK]   Reasoning effort list unlock", upgrade_result.stdout)
             fully_patched_model_filter = model_filter.read_text("utf-8")
 
             ultra_only_model_filter = model_filter_source.replace(
@@ -339,7 +342,7 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
                 0,
                 ultra_only_result.stdout + ultra_only_result.stderr,
             )
-            self.assertIn("[OK]   推理强度列表解锁", ultra_only_result.stdout)
+            self.assertIn("[OK]   Reasoning effort list unlock", ultra_only_result.stdout)
             self.assertIn(
                 "(e===`apikey`||i.has(__codexReasoningEffort))",
                 model_filter.read_text("utf-8"),
@@ -358,7 +361,7 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
                 0,
                 enabled_only_result.stdout + enabled_only_result.stderr,
             )
-            self.assertIn("[OK]   推理强度列表解锁", enabled_only_result.stdout)
+            self.assertIn("[OK]   Reasoning effort list unlock", enabled_only_result.stdout)
             self.assertIn(
                 "x=(e===`apikey`||a)?r.supportedReasoningEfforts",
                 model_filter.read_text("utf-8"),
@@ -377,7 +380,10 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
             model_filter.write_text(duplicate_filter, encoding="utf-8")
             duplicate_result = self.run_patch(assets)
             self.assertNotEqual(duplicate_result.returncode, 0)
-            self.assertIn("推理强度列表解锁: 目标结构不匹配", duplicate_result.stdout)
+            self.assertIn(
+                "Reasoning effort list unlock: Target structure mismatch",
+                duplicate_result.stdout,
+            )
             self.assertEqual(duplicate_filter, model_filter.read_text("utf-8"))
             model_filter.write_text(fully_patched_model_filter, encoding="utf-8")
 
@@ -401,16 +407,18 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
                     self.assertNotIn("[FAIL]", result.stdout)
                     self.assertEqual(source, native_plugins.read_text("utf-8"))
                     self.assertIn(
-                        "[SKIP] 旧版插件连接器 UI 门控 "
-                        "(新版已移除该旧补丁点)",
+                        "[SKIP] Legacy plugin connector UI gate "
+                        "(Removed from current build)",
                         result.stdout,
                     )
                     self.assertIn(
-                        "[SKIP] 品牌视觉/插件市场统一 "
-                        "(新版已原生支持 API key)",
+                        "[SKIP] Branding/plugin marketplace compatibility "
+                        "(Current build natively supports API keys)",
                         result.stdout,
                     )
-                    self.assertNotIn("[OK] 品牌视觉/插件统一", result.stdout)
+                    self.assertNotIn(
+                        "[OK]   Branding/plugin compatibility", result.stdout
+                    )
 
             drifted_model_filter = model_filter_source.replace(
                 "includeUltraReasoningEffort:a,", ""
@@ -418,7 +426,10 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
             model_filter.write_text(drifted_model_filter, encoding="utf-8")
             drift_result = self.run_patch(assets)
             self.assertNotEqual(drift_result.returncode, 0)
-            self.assertIn("推理强度列表解锁: 目标结构不匹配", drift_result.stdout)
+            self.assertIn(
+                "Reasoning effort list unlock: Target structure mismatch",
+                drift_result.stdout,
+            )
             self.assertEqual(drifted_model_filter, model_filter.read_text("utf-8"))
             model_filter.write_text(fully_patched_model_filter, encoding="utf-8")
 
@@ -429,7 +440,9 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
             native_plugins.write_text(asi_source, encoding="utf-8")
             asi_result = self.run_patch(assets)
             self.assertNotEqual(asi_result.returncode, 0)
-            self.assertNotIn("新版已原生支持 API key", asi_result.stdout)
+            self.assertNotIn(
+                "Current build natively supports API keys", asi_result.stdout
+            )
             self.assertEqual(asi_source, native_plugins.read_text("utf-8"))
 
     def test_desktop_gate_patch_migrates_shadowing_pr5_form(self):
@@ -489,7 +502,7 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
             migrated_content = desktop_features.read_text("utf-8")
             second = self.run_patch(assets)
             self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
-            self.assertIn("[SKIP] Computer Use 可用性", second.stdout)
+            self.assertIn("[SKIP] Computer Use availability", second.stdout)
             self.assertEqual(migrated_content, desktop_features.read_text("utf-8"))
 
     def test_windows_taskbar_identity_is_unique_idempotent_and_fails_closed(self):
@@ -661,7 +674,7 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
                 patch_module.step_copy_store(store_root)
 
             run_cmd.assert_not_called()
-            self.assertIn("无法清理旧补丁目录", output.getvalue())
+            self.assertIn("Unable to remove the old patched directory", output.getvalue())
             self.assertIn("Computer Use", output.getvalue())
 
     def test_current_desktop_feature_marker_drift_fails_closed(self):
@@ -677,7 +690,9 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
             result = self.run_patch(assets)
 
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("[FAIL] Browser / Computer Use 可用性", result.stdout)
+            self.assertIn(
+                "[FAIL] Browser / Computer Use availability", result.stdout
+            )
             self.assertEqual(drifted_content, desktop_features.read_text("utf-8"))
 
     def test_macos_merged_chunks_are_discovered_and_patched_idempotently(self):
@@ -756,11 +771,13 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
                 dictation.read_text("utf-8"),
             )
             self.assertIn(
-                "[SKIP] 旧版插件连接器 UI 门控 (新版已移除该旧补丁点)",
+                "[SKIP] Legacy plugin connector UI gate "
+                "(Removed from current build)",
                 first.stdout,
             )
             self.assertIn(
-                "[SKIP] 品牌视觉/插件市场统一 (新版已原生支持 API key)",
+                "[SKIP] Branding/plugin marketplace compatibility "
+                "(Current build natively supports API keys)",
                 first.stdout,
             )
 
@@ -770,8 +787,8 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
             second = self.run_patch(assets)
             self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
             self.assertNotIn("[FAIL]", second.stdout)
-            self.assertIn("[SKIP] 语音输入解锁", second.stdout)
-            self.assertIn("[SKIP] 推理强度列表解锁", second.stdout)
+            self.assertIn("[SKIP] Dictation unlock", second.stdout)
+            self.assertIn("[SKIP] Reasoning effort list unlock", second.stdout)
             self.assertEqual(
                 contents,
                 {path.name: path.read_text("utf-8") for path in assets.glob("*.js")},
@@ -937,7 +954,7 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
             ):
                 patch_module._require_successful_js_patch()
 
-            self.assertIn("已停止重打包与签名", output.getvalue())
+            self.assertIn("packaging and signing stopped", output.getvalue())
 
     def test_macos_adhoc_entitlements_drop_restricted_team_values(self):
         with loaded_patch_module() as patch_module:
