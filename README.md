@@ -2,7 +2,7 @@
 
 This project targets the Codex desktop app whose display name has been changed to **ChatGPT**. It unlocks the model list, reasoning effort levels, service tiers, and other features in API key mode.
 
-It has been verified with Windows Store version `26.707.3748.0` and the macOS app version `26.707.31428` (Apple Silicon). In these versions, the display name and primary entry point have changed to ChatGPT, while installation packages may still use the Codex name. The script supports both the old and new names.
+It has been verified with Windows Store version `26.707.3748.0` and the macOS app versions `26.707.31428` and `26.721.31836` (Apple Silicon). In these versions, the display name and primary entry point have changed to ChatGPT, while installation packages may still use the Codex name. The script supports both the old and new names.
 
 ## Unlocked Features
 
@@ -30,7 +30,7 @@ It has been verified with Windows Store version `26.707.3748.0` and the macOS ap
 ```
 patch.py                  Main script: one-command workflow for both ChatGPT and Codex names (macOS / Windows)
 SKILL.md                  Full technical documentation, including the version-update troubleshooting guide
-tests/test_patch.py       Regression tests for 26.707 models, reasoning effort, Fast, Browser, CUA, and the macOS workflow
+tests/test_patch.py       Regression tests for 26.707/26.721 models, reasoning effort, Fast, Browser, CUA, and the macOS workflow
 ```
 
 ## Usage

@@ -445,6 +445,75 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
             )
             self.assertEqual(asi_source, native_plugins.read_text("utf-8"))
 
+    def test_26721_additional_models_filter_is_patched_idempotently(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets = Path(tmp)
+            fixture = write_supported_assets(assets)
+            model_filter = fixture["model_filter"]
+            source = fixture["model_filter_source"].replace(
+                "function filter({authMethod:e,availableModels:n,",
+                "function filter({additionalAvailableModels:q,authMethod:e,"
+                "availableModels:n,",
+            ).replace(
+                "if(u?n.has(r.model):!r.hidden){",
+                "if(q?.has(r.model)===!0||(u?n.has(r.model):!r.hidden)){",
+            )
+            hidden_verifier = (
+                "function hiddenCount(authMethod,additionalAvailableModels){"
+                "shown=[];filter({additionalAvailableModels,authMethod,"
+                "availableModels:new Set(),enabledReasoningEfforts:"
+                "new Set(validEfforts),includeUltraReasoningEffort:true,"
+                "models:[{model:`hidden`,hidden:true,isDefault:false,"
+                "supportedReasoningEfforts:efforts}],useHiddenModels:false});"
+                "return shown.length}"
+                "if(process.argv[2]===`--verify-hidden`){console.log(JSON.stringify({"
+                "apikey:hiddenCount(`apikey`,new Set()),"
+                "chatgpt:hiddenCount(`chatgpt`,new Set()),"
+                "chatgptAdditional:hiddenCount(`chatgpt`,new Set([`hidden`]))}))}"
+            )
+            source = source.replace(
+                "if(process.argv[2]===`--verify`)",
+                hidden_verifier + "if(process.argv[2]===`--verify`)",
+            )
+            model_filter.write_text(source, encoding="utf-8")
+
+            first = self.run_patch(assets)
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            self.assertIn("[OK]   Hidden model list unlock", first.stdout)
+            self.assertIn(
+                "if(q?.has(r.model)===!0||"
+                "(e===`apikey`||(u?n.has(r.model):!r.hidden)))",
+                model_filter.read_text("utf-8"),
+            )
+
+            node = shutil.which("node")
+            if node is None:
+                self.fail("Node.js is required for hidden-model semantic tests")
+            semantic_result = subprocess.run(
+                [node, str(model_filter), "--verify-hidden"],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            self.assertEqual(
+                semantic_result.returncode,
+                0,
+                semantic_result.stdout + semantic_result.stderr,
+            )
+            self.assertEqual(
+                json.loads(semantic_result.stdout),
+                {"apikey": 1, "chatgpt": 0, "chatgptAdditional": 1},
+            )
+
+            patched_source = model_filter.read_text("utf-8")
+            second = self.run_patch(assets)
+            self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+            self.assertIn("[SKIP] Hidden model list unlock", second.stdout)
+            self.assertEqual(patched_source, model_filter.read_text("utf-8"))
+
     def test_desktop_gate_patch_migrates_shadowing_pr5_form(self):
         with tempfile.TemporaryDirectory() as tmp:
             assets = Path(tmp)

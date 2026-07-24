@@ -1036,37 +1036,33 @@ def apply_model_filter_patch(fp):
         else len(content)
     )
     function_body = content[signature_match.end():function_end]
-    condition_pattern = re.compile(
-        r'if\((?P<mode>[a-zA-Z_$]+)\?'
-        r'(?P<allowed>[a-zA-Z_$]+)\.has\('
-        r'(?P<model>[a-zA-Z_$]+)\.model\):!'
-        r'(?P=model)\.hidden\)\{'
+    visibility_pattern = (
+        rf'(?P<mode>{identifier})\?(?P<allowed>{identifier})\.has\('
+        rf'(?P<model>{identifier})\.model\):!(?P=model)\.hidden'
     )
+    condition_pattern = re.compile(visibility_pattern)
     patched_pattern = re.compile(
-        rf'if\({re.escape(auth)}===`apikey`\|\|\('
-        r'[a-zA-Z_$]+\?[a-zA-Z_$]+\.has\('
-        r'([a-zA-Z_$]+)\.model\):!\1\.hidden\)\)\{'
+        rf'{re.escape(auth)}===`apikey`\|\|\((?P<visibility>'
+        rf'{visibility_pattern})\)'
     )
-    if patched_pattern.search(function_body):
+    condition_matches = list(condition_pattern.finditer(function_body))
+    patched_matches = list(patched_pattern.finditer(function_body))
+    if len(patched_matches) == 1 and len(condition_matches) == 1:
         results["skipped"].append(f"{bn}: Hidden model list unlock")
         print("    [SKIP] Hidden model list unlock")
         return
-
-    condition_match = condition_pattern.search(function_body)
-    if condition_match is None:
+    if patched_matches or len(condition_matches) != 1:
+        reason = "Target structure mismatch"
+        if len(condition_matches) > 1:
+            reason = f"Found {len(condition_matches)} model visibility conditions"
         mark_missing(
             f"{bn}: Hidden model list unlock",
-            "Target structure mismatch",
+            reason,
         )
         return
 
-    mode = condition_match.group("mode")
-    allowed = condition_match.group("allowed")
-    model = condition_match.group("model")
-    patched = (
-        f"if({auth}===`apikey`||"
-        f"({mode}?{allowed}.has({model}.model):!{model}.hidden)){{"
-    )
+    condition_match = condition_matches[0]
+    patched = f"{auth}===`apikey`||({condition_match.group(0)})"
     if not DRY_RUN:
         start = signature_match.end() + condition_match.start()
         end = signature_match.end() + condition_match.end()
