@@ -514,6 +514,115 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
             self.assertIn("[SKIP] Hidden model list unlock", second.stdout)
             self.assertEqual(patched_source, model_filter.read_text("utf-8"))
 
+    def test_26818_split_model_visibility_filter_is_patched_idempotently(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets = Path(tmp)
+            fixture = write_supported_assets(assets)
+            model_filter = fixture["model_filter"]
+            source = fixture["model_filter_source"].replace(
+                "function filter({authMethod:e,availableModels:n,",
+                "function filter({additionalAvailableModels:q,authMethod:e,"
+                "availableModels:n,",
+            ).replace(
+                "includeUltraReasoningEffort:a,models:o,useHiddenModels:s}){",
+                "includeUltraReasoningEffort:a,isCustomModelProvider:c=false,"
+                "models:o,useHiddenModels:s}){",
+            ).replace(
+                "if(u?n.has(r.model):!r.hidden){",
+                "if(visible({additionalAvailableModels:q,authMethod:e,"
+                "availableModels:n,isCustomModelProvider:c,model:r,"
+                "useHiddenModels:s})){",
+            )
+            visibility_predicate = (
+                "function visible({additionalAvailableModels:q,authMethod:e,"
+                "availableModels:n,isCustomModelProvider:c,model:r,"
+                "useHiddenModels:s}){return q?.has(r.model)===!0||"
+                "r.model!==`codex-auto-review`&&(s&&!c&&e!==`amazonBedrock`?"
+                "n.has(r.model):!r.hidden)}"
+            )
+            unrelated_predicate = (
+                "function unrelated({authMethod:e,availableModels:n,"
+                "isCustomModelProvider:c,model:r,useHiddenModels:s}){"
+                "let other=false;return s&&!other&&e!==`amazonBedrock`?"
+                "n.has(r.model):!r.hidden}"
+            )
+            verifier = (
+                "function hiddenCount(authMethod,model,additionalAvailableModels,"
+                "isCustomModelProvider=false,useHiddenModels=false){"
+                "shown=[];filter({additionalAvailableModels,authMethod,"
+                "availableModels:new Set(),enabledReasoningEfforts:"
+                "new Set(validEfforts),includeUltraReasoningEffort:true,"
+                "isCustomModelProvider,models:[{model,hidden:true,"
+                "isDefault:false,supportedReasoningEfforts:efforts}],"
+                "useHiddenModels});return shown.length}"
+                "if(process.argv[2]===`--verify-26818`){console.log(JSON.stringify({"
+                "apikey:hiddenCount(`apikey`,`hidden`,new Set()),"
+                "chatgpt:hiddenCount(`chatgpt`,`hidden`,new Set()),"
+                "chatgptAdditional:hiddenCount(`chatgpt`,`hidden`,"
+                "new Set([`hidden`])),apikeyAutoReview:hiddenCount(`apikey`,"
+                "`codex-auto-review`,new Set()),apikeyAutoReviewAdditional:"
+                "hiddenCount(`apikey`,`codex-auto-review`,"
+                "new Set([`codex-auto-review`])),chatgptCustom:hiddenCount("
+                "`chatgpt`,`hidden`,new Set(),true,true),apikeyCustom:"
+                "hiddenCount(`apikey`,`hidden`,new Set(),true,true)}))}"
+            )
+            source = source.replace(
+                "const efforts=",
+                unrelated_predicate + visibility_predicate + "const efforts=",
+            ).replace(
+                "if(process.argv[2]===`--verify`)",
+                verifier + "if(process.argv[2]===`--verify`)",
+            )
+            model_filter.write_text(source, encoding="utf-8")
+
+            first = self.run_patch(assets)
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            self.assertIn("[OK]   Hidden model list unlock", first.stdout)
+            patched_content = model_filter.read_text("utf-8")
+            self.assertIn(
+                "q?.has(r.model)===!0||r.model!==`codex-auto-review`&&"
+                "(e===`apikey`||(s&&!c&&e!==`amazonBedrock`?"
+                "n.has(r.model):!r.hidden))",
+                patched_content,
+            )
+            self.assertIn(unrelated_predicate, patched_content)
+
+            node = shutil.which("node")
+            if node is None:
+                self.fail("Node.js is required for hidden-model semantic tests")
+            semantic_result = subprocess.run(
+                [node, str(model_filter), "--verify-26818"],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            self.assertEqual(
+                semantic_result.returncode,
+                0,
+                semantic_result.stdout + semantic_result.stderr,
+            )
+            self.assertEqual(
+                json.loads(semantic_result.stdout),
+                {
+                    "apikey": 1,
+                    "chatgpt": 0,
+                    "chatgptAdditional": 1,
+                    "apikeyAutoReview": 0,
+                    "apikeyAutoReviewAdditional": 1,
+                    "chatgptCustom": 0,
+                    "apikeyCustom": 1,
+                },
+            )
+
+            patched_source = model_filter.read_text("utf-8")
+            second = self.run_patch(assets)
+            self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+            self.assertIn("[SKIP] Hidden model list unlock", second.stdout)
+            self.assertEqual(patched_source, model_filter.read_text("utf-8"))
+
     def test_desktop_gate_patch_migrates_shadowing_pr5_form(self):
         with tempfile.TemporaryDirectory() as tmp:
             assets = Path(tmp)
@@ -611,6 +720,24 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
             patch_module.apply_windows_app_user_model_id_patch(str(main_build))
             self.assertEqual(drifted, identity_file.read_text("utf-8"))
             self.assertEqual(1, len(patch_module.results["failed"]))
+
+    def test_windows_shortcut_clears_stale_arguments(self):
+        with loaded_patch_module() as patch_module, tempfile.TemporaryDirectory() as tmp:
+            patch_module.DRY_RUN = False
+            exe_path = str(Path(tmp) / "ChatGPT.exe")
+            with (
+                mock.patch.object(
+                    patch_module.os.path, "expanduser", return_value=tmp
+                ),
+                mock.patch.object(patch_module, "run_cmd") as run_cmd,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                patch_module.step_shortcut_windows(exe_path, tmp)
+
+            command = run_cmd.call_args.args[0]
+            self.assertEqual(command[:3], ["powershell", "-NoProfile", "-Command"])
+            self.assertIn("$lnk.TargetPath='", command[3])
+            self.assertIn("$lnk.Arguments='';", command[3])
 
     def test_windows_shutdown_hides_missing_main_and_only_scans_patched_root(self):
         with loaded_patch_module() as patch_module:

@@ -980,6 +980,24 @@ def _native_apikey_plugins_file(assets):
     return None
 
 
+def _model_visibility_pattern(auth, use_hidden, custom_provider=None):
+    identifier = r'[a-zA-Z_$][a-zA-Z0-9_$]*'
+    mode = identifier
+    if custom_provider is not None:
+        current_mode = (
+            rf'{re.escape(use_hidden)}[ \t]*&&[ \t]*![ \t]*'
+            rf'{re.escape(custom_provider)}[ \t]*&&[ \t]*'
+            rf'{re.escape(auth)}[ \t]*!==[ \t]*`amazonBedrock`'
+        )
+        mode = rf'(?:{current_mode}|{identifier})'
+    return re.compile(
+        rf'(?P<mode>{mode})[ \t]*\?[ \t]*'
+        rf'(?P<allowed>{identifier})\.has\('
+        rf'(?P<model>{identifier})\.model\)[ \t]*:[ \t]*'
+        rf'!(?P=model)\.hidden'
+    )
+
+
 def _model_filter_signature(content, bn, patch_name, required_fields):
     identifier = r'[a-zA-Z_$][a-zA-Z0-9_$]*'
     signature_pattern = re.compile(
@@ -999,7 +1017,29 @@ def _model_filter_signature(content, bn, patch_name, required_fields):
                 break
             aliases[field] = field_match.group("alias") or field
         else:
-            target_signatures.append((signature_match, aliases))
+            custom_provider_match = re.search(
+                rf'(?:^|,)[ \t]*isCustomModelProvider'
+                rf'(?::(?P<alias>{identifier}))?'
+                rf'(?:=[^,]*)?[ \t]*(?=,|$)',
+                fields,
+            )
+            aliases["isCustomModelProvider"] = (
+                (custom_provider_match.group("alias") or
+                 "isCustomModelProvider")
+                if custom_provider_match is not None else None
+            )
+            scope_end = _js_block_end(content, signature_match.end() - 1)
+            if scope_end is None:
+                continue
+            visibility_pattern = _model_visibility_pattern(
+                aliases["authMethod"],
+                aliases["useHiddenModels"],
+                aliases["isCustomModelProvider"],
+            )
+            if visibility_pattern.search(
+                content[signature_match.end():scope_end]
+            ) is not None:
+                target_signatures.append((signature_match, aliases))
 
     if len(target_signatures) != 1:
         reason = "Target structure mismatch"
@@ -1026,24 +1066,19 @@ def apply_model_filter_patch(fp):
 
     signature_match, aliases = target
     auth = aliases["authMethod"]
-    identifier = r'[a-zA-Z_$][a-zA-Z0-9_$]*'
-    next_function = re.search(
-        rf'function[ \t]+{identifier}[ \t]*\(', content[signature_match.end():]
-    )
-    function_end = (
-        signature_match.end() + next_function.start()
-        if next_function is not None
-        else len(content)
-    )
+    function_end = _js_block_end(content, signature_match.end() - 1)
+    if function_end is None:
+        mark_missing(f"{bn}: Hidden model list unlock", "Target structure mismatch")
+        return
     function_body = content[signature_match.end():function_end]
-    visibility_pattern = (
-        rf'(?P<mode>{identifier})\?(?P<allowed>{identifier})\.has\('
-        rf'(?P<model>{identifier})\.model\):!(?P=model)\.hidden'
+    condition_pattern = _model_visibility_pattern(
+        auth,
+        aliases["useHiddenModels"],
+        aliases["isCustomModelProvider"],
     )
-    condition_pattern = re.compile(visibility_pattern)
     patched_pattern = re.compile(
         rf'{re.escape(auth)}===`apikey`\|\|\((?P<visibility>'
-        rf'{visibility_pattern})\)'
+        rf'{condition_pattern.pattern})\)'
     )
     condition_matches = list(condition_pattern.finditer(function_body))
     patched_matches = list(patched_pattern.finditer(function_body))
@@ -1895,6 +1930,7 @@ def step_shortcut_windows(exe_path, work_dir):
         f"$wsh=New-Object -ComObject WScript.Shell;"
         f"$lnk=$wsh.CreateShortcut('{shortcut}');"
         f"$lnk.TargetPath='{exe_path}';"
+        f"$lnk.Arguments='';"
         f"$lnk.WorkingDirectory='{work_dir}';"
         f"$lnk.IconLocation='{exe_path},0';"
         f"$lnk.Description='{display_name} (API Key Features Unlocked)';"
