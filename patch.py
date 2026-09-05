@@ -1151,6 +1151,136 @@ def _js_block_end(content, opening_brace):
     return None
 
 
+def _patch_dictation_capability_gate(assets):
+    """Patch the scoped voice/dictation capability gate used by newer builds."""
+    identifier = r'[a-zA-Z_$][a-zA-Z0-9_$]*'
+    original = re.compile(
+        rf'(?P<auth>{identifier})\.authMethod!==`chatgpt`&&'
+        rf'(?P<status>{identifier})\.status===`allowed`\?'
+        rf'\{{status:`denied`,reason:`unsupported-auth`\}}:'
+        rf'(?P=status)'
+    )
+    patched = re.compile(
+        rf'(?P<auth>{identifier})\.authMethod!==`chatgpt`&&'
+        rf'(?P=auth)\.authMethod!==`apikey`&&'
+        rf'(?P<status>{identifier})\.status===`allowed`\?'
+        rf'\{{status:`denied`,reason:`unsupported-auth`\}}:'
+        rf'(?P=status)'
+    )
+    candidates = []
+    for fp in glob.glob(os.path.join(assets, "*.js")):
+        with open(fp, encoding="utf-8") as fh:
+            content = fh.read()
+        original_matches = list(original.finditer(content))
+        patched_matches = list(patched.finditer(content))
+        if original_matches or patched_matches:
+            candidates.append((fp, content, original_matches, patched_matches))
+
+    if len(candidates) != 1:
+        if len(candidates) > 1:
+            mark_missing("Dictation unlock", "Found multiple capability gates")
+        return False
+
+    fp, content, original_matches, patched_matches = candidates[0]
+    bn = os.path.basename(fp)
+    if len(patched_matches) == 1 and not original_matches:
+        results["skipped"].append(f"{bn}: Dictation unlock")
+        print("    [SKIP] Dictation unlock")
+        return True
+    if len(original_matches) != 1 or patched_matches:
+        mark_missing(f"{bn}: Dictation unlock", "Target structure mismatch")
+        return True
+
+    match = original_matches[0]
+    auth = match.group("auth")
+    replacement = (
+        f"{auth}.authMethod!==`chatgpt`&&{auth}.authMethod!==`apikey`&&"
+        f"{match.group('status')}.status===`allowed`?"
+        "{status:`denied`,reason:`unsupported-auth`}:"
+        f"{match.group('status')}"
+    )
+    if not DRY_RUN:
+        content = content[:match.start()] + replacement + content[match.end():]
+        with open(fp, "w", encoding="utf-8") as fh:
+            fh.write(content)
+    results["applied"].append(f"{bn}: Dictation unlock (scoped regex)")
+    print("    [OK]   Dictation unlock (scoped regex)")
+    return True
+
+
+def _patch_usage_settings_capability_gate(assets):
+    """Patch the auth-aware usage-settings predicate in its own function scope."""
+    identifier = r'[a-zA-Z_$][a-zA-Z0-9_$]*'
+    signature_pattern = re.compile(
+        rf'function[ \t]+{identifier}[ \t]*\([ \t]*\{{'
+        rf'(?P<fields>[^}}]*)\}}[ \t]*\)[ \t]*\{{'
+    )
+    candidates = []
+    for fp in glob.glob(os.path.join(assets, "*.js")):
+        with open(fp, encoding="utf-8") as fh:
+            content = fh.read()
+        for signature in signature_pattern.finditer(content):
+            auth_match = re.search(
+                rf'(?:^|,)[ \t]*authMethod'
+                rf'(?:[ \t]*:[ \t]*(?P<alias>{identifier}))?'
+                rf'[ \t]*(?=,|$)',
+                signature.group("fields"),
+            )
+            if auth_match is None:
+                continue
+            auth = auth_match.group("alias") or "authMethod"
+            scope_end = _js_block_end(content, signature.end() - 1)
+            if scope_end is None:
+                continue
+            scope = content[signature.end():scope_end]
+            if "isUsageSettingsVisible" not in scope:
+                continue
+            original = list(re.finditer(
+                rf'let[ \t]+(?P<flag>{identifier})='
+                rf'{re.escape(auth)}===`chatgpt`(?!\|\|)',
+                scope,
+            ))
+            patched = list(re.finditer(
+                rf'let[ \t]+(?P<flag>{identifier})='
+                rf'{re.escape(auth)}===`chatgpt`\|\|'
+                rf'{re.escape(auth)}===`apikey`',
+                scope,
+            ))
+            if original or patched:
+                candidates.append((fp, content, signature, scope_end,
+                                   original, patched, auth))
+
+    if len(candidates) != 1:
+        if len(candidates) > 1:
+            mark_missing("Usage settings unlock", "Found multiple usage predicates")
+        return False
+
+    fp, content, signature, scope_end, original, patched, auth = candidates[0]
+    bn = os.path.basename(fp)
+    if len(patched) == 1 and not original:
+        results["skipped"].append(f"{bn}: Usage settings unlock")
+        print("    [SKIP] Usage settings unlock")
+        return True
+    if len(original) != 1 or patched:
+        mark_missing(f"{bn}: Usage settings unlock", "Target structure mismatch")
+        return True
+
+    match = original[0]
+    replacement = (
+        f"let {match.group('flag')}={auth}===`chatgpt`||"
+        f"{auth}===`apikey`"
+    )
+    start = signature.end() + match.start()
+    end = signature.end() + match.end()
+    if not DRY_RUN:
+        content = content[:start] + replacement + content[end:]
+        with open(fp, "w", encoding="utf-8") as fh:
+            fh.write(content)
+    results["applied"].append(f"{bn}: Usage settings unlock (scoped regex)")
+    print("    [OK]   Usage settings unlock (scoped regex)")
+    return True
+
+
 def apply_reasoning_effort_filter_patch(fp, validate_only=False):
     with open(fp, encoding="utf-8") as fh:
         content = fh.read()
@@ -1595,49 +1725,51 @@ def step_patch_js(assets):
                 skip_regex=r'function [a-zA-Z_$]+\([a-zA-Z_$]+\)\{return false&&[a-zA-Z_$]+!==`chatgpt`\}')
 
     # -- Module 7: dictation (1 patch) ---------------------------------
-    # Current builds (26.602+) use n&&t.authMethod===`chatgpt` in
-    # use-is-dictation-supported-*.js. Older builds use
-    # annotation-comment-editor-card-*.js.
+    # Newer merged builds keep the voice/dictation capability predicate in a
+    # scoped function that returns reason=unsupported-auth. Older builds use
+    # use-is-dictation-supported-*.js or annotation-comment-editor-card-*.js.
     print("\n  [Module 7] Dictation")
-    files = _find(assets, "use-is-dictation-supported-*.js")
-    if not files:
-        files = _find(assets, "annotation-comment-editor-card-*.js")
-    if not files:
-        # Match only files with the dictation predicate to avoid app-main.
-        dictation_original = re.compile(
-            r'[a-zA-Z_$]+&&[a-zA-Z_$]+\.authMethod===`chatgpt`'
-        )
-        dictation_patched = re.compile(
-            r'[a-zA-Z_$]+&&\([a-zA-Z_$]+\.authMethod===`chatgpt`\|\|'
-            r'[a-zA-Z_$]+\.authMethod===`apikey`\)'
-        )
-        for f in glob.glob(os.path.join(assets, "*.js")):
-            with open(f, encoding="utf-8") as fh:
-                c = fh.read()
-            if "dictation" in c.lower() and (
-                    dictation_original.search(c) or dictation_patched.search(c)):
-                files = [f]; break
-    for fp in files:
-        apply_patch(fp, "Dictation unlock",
-            None, None,
-            r'([a-zA-Z_$]+)&&([a-zA-Z_$]+)\.authMethod===`chatgpt`(?!\|\|)',
-            lambda m: f"{m.group(1)}&&({m.group(2)}.authMethod===`chatgpt`||{m.group(2)}.authMethod===`apikey`)",
-            skip_regex=r'authMethod===`chatgpt`\|\|[a-zA-Z_$]+\.authMethod===`apikey`')
+    if not _patch_dictation_capability_gate(assets):
+        files = _find(assets, "use-is-dictation-supported-*.js")
+        if not files:
+            files = _find(assets, "annotation-comment-editor-card-*.js")
+        if not files:
+            # Match only files with the dictation predicate to avoid app-main.
+            dictation_original = re.compile(
+                r'[a-zA-Z_$]+&&[a-zA-Z_$]+\.authMethod===`chatgpt`'
+            )
+            dictation_patched = re.compile(
+                r'[a-zA-Z_$]+&&\([a-zA-Z_$]+\.authMethod===`chatgpt`\|\|'
+                r'[a-zA-Z_$]+\.authMethod===`apikey`\)'
+            )
+            for f in glob.glob(os.path.join(assets, "*.js")):
+                with open(f, encoding="utf-8") as fh:
+                    c = fh.read()
+                if "dictation" in c.lower() and (
+                        dictation_original.search(c) or dictation_patched.search(c)):
+                    files = [f]; break
+        for fp in files:
+            apply_patch(fp, "Dictation unlock",
+                None, None,
+                r'([a-zA-Z_$]+)&&([a-zA-Z_$]+)\.authMethod===`chatgpt`(?!\|\|)',
+                lambda m: f"{m.group(1)}&&({m.group(2)}.authMethod===`chatgpt`||{m.group(2)}.authMethod===`apikey`)",
+                skip_regex=r'authMethod===`chatgpt`\|\|[a-zA-Z_$]+\.authMethod===`apikey`')
 
     # -- Module 8: usage settings (1 patch) ----------------------------
     print("\n  [Module 8] Usage settings")
-    files = _find(assets, "use-usage-settings-access-*.js")
-    if not files:
-        for f in glob.glob(os.path.join(assets, "*.js")):
-            with open(f, encoding="utf-8") as fh:
-                if re.search(r'let [a-zA-Z_$]+=[a-zA-Z_$]+===`chatgpt`', fh.read()):
-                    files = [f]; break
-    for fp in files:
-        apply_patch(fp, "Usage settings unlock",
-            "let r=e===`chatgpt`", "let r=e===`chatgpt`||e===`apikey`",
-            r'let\s+([a-zA-Z_$]+)=([a-zA-Z_$]+)===`chatgpt`(?!\|\|)',
-            lambda m: f"let {m.group(1)}={m.group(2)}===`chatgpt`||{m.group(2)}===`apikey`",
-            skip_regex=r'let [a-zA-Z_$]+=[a-zA-Z_$]+===`chatgpt`\|\|[a-zA-Z_$]+===`apikey`')
+    if not _patch_usage_settings_capability_gate(assets):
+        files = _find(assets, "use-usage-settings-access-*.js")
+        if not files:
+            for f in glob.glob(os.path.join(assets, "*.js")):
+                with open(f, encoding="utf-8") as fh:
+                    if re.search(r'let [a-zA-Z_$]+=[a-zA-Z_$]+===`chatgpt`', fh.read()):
+                        files = [f]; break
+        for fp in files:
+            apply_patch(fp, "Usage settings unlock",
+                "let r=e===`chatgpt`", "let r=e===`chatgpt`||e===`apikey`",
+                r'let\s+([a-zA-Z_$]+)=([a-zA-Z_$]+)===`chatgpt`(?!\|\|)',
+                lambda m: f"let {m.group(1)}={m.group(2)}===`chatgpt`||{m.group(2)}===`apikey`",
+                skip_regex=r'let [a-zA-Z_$]+=[a-zA-Z_$]+===`chatgpt`\|\|[a-zA-Z_$]+===`apikey`')
 
     # When Store/traditional installs and the patched copy share the official
     # AUMID, pinned taskbar entries reopen the Store build. Assign a separate
@@ -1657,7 +1789,7 @@ def _require_successful_js_patch():
 # Step 6: disable Electron fuses
 # ================================================================
 def step_fuses(exe_path):
-    print("\n[6] Disabling Electron fuses...")
+    print("\n[6.5] Disabling Electron fuses...")
     flags = [
         "OnlyLoadAppFromAsar=off",
         "EnableEmbeddedAsarIntegrityValidation=off",
@@ -1796,6 +1928,66 @@ def _asar_header_hash(asar_path):
     return hashlib.sha256(header).hexdigest()
 
 
+def step_update_windows_asar_integrity(exe_path, resources_dir):
+    """Update the embedded ASAR header hash in a copied Windows executable."""
+    print("\n[6] Updating Windows ASAR integrity metadata...")
+    if DRY_RUN:
+        print("    [DRY-RUN] Integrity metadata update skipped")
+        return
+
+    asar = os.path.join(resources_dir, "app.asar")
+    asar_backup = os.path.join(resources_dir, "app.asar.bak")
+    try:
+        original_hash = _asar_header_hash(asar_backup)
+        patched_hash = _asar_header_hash(asar)
+    except ValueError as exc:
+        _die(str(exc))
+
+    if original_hash == patched_hash:
+        print("    ASAR header is unchanged; no executable update needed.")
+        return
+
+    old_bytes = original_hash.encode("ascii")
+    new_bytes = patched_hash.encode("ascii")
+    try:
+        with open(exe_path, "rb") as fh:
+            image = bytearray(fh.read())
+    except OSError as exc:
+        _die(f"Unable to read Windows executable for ASAR integrity update: {exc}")
+
+    occurrences = image.count(old_bytes)
+    if occurrences == 0:
+        if image.count(new_bytes) > 0:
+            print("    Embedded ASAR hash is already current.")
+            return
+        _die(
+            "Windows executable does not contain the original embedded ASAR "
+            "hash; refusing an ambiguous binary edit."
+        )
+
+    image = image.replace(old_bytes, new_bytes)
+    try:
+        with open(exe_path, "r+b") as fh:
+            fh.seek(0)
+            fh.write(image)
+            fh.truncate()
+    except OSError as exc:
+        _die(f"Unable to write Windows executable ASAR integrity hash: {exc}")
+
+    with open(exe_path, "rb") as fh:
+        verified = fh.read()
+    if old_bytes in verified or verified.count(new_bytes) < occurrences:
+        _die("Windows executable ASAR integrity hash verification failed.")
+    print(f"    Embedded ASAR hash updated ({occurrences} occurrence(s)).")
+    print("    Note: the copied executable's vendor signature is no longer valid; the official app is unchanged.")
+
+
+def _windows_patched_user_data_dir():
+    return os.path.join(
+        os.environ["LOCALAPPDATA"], "ChatGPT-Codex-Patched", "User Data"
+    )
+
+
 def step_update_macos_asar_integrity(app_path):
     print("\n[6] Updating macOS ASAR integrity metadata...")
     if DRY_RUN:
@@ -1926,11 +2118,13 @@ def step_shortcut_windows(exe_path, work_dir):
     if DRY_RUN:
         print(f"    [DRY-RUN] {shortcut}")
         return
+    user_data_dir = _windows_patched_user_data_dir()
+    escaped_user_data_dir = user_data_dir.replace("'", "''")
     ps = (
         f"$wsh=New-Object -ComObject WScript.Shell;"
         f"$lnk=$wsh.CreateShortcut('{shortcut}');"
         f"$lnk.TargetPath='{exe_path}';"
-        f"$lnk.Arguments='';"
+        f"$lnk.Arguments='--user-data-dir=\"{escaped_user_data_dir}\"';"
         f"$lnk.WorkingDirectory='{work_dir}';"
         f"$lnk.IconLocation='{exe_path},0';"
         f"$lnk.Description='{display_name} (API Key Features Unlocked)';"
@@ -2004,6 +2198,7 @@ else:
         step_update_macos_asar_integrity(work_root)
         step_finish_macos(work_root)
     else:
+        step_update_windows_asar_integrity(exe_path, resources_dir)
         step_fuses(exe_path)
         if IS_WINDOWS and is_store:
             step_shortcut_windows(exe_path, work_root)

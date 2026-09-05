@@ -108,6 +108,14 @@ Remove-Item -Recurse -Force "$env:LOCALAPPDATA\Programs\ChatGPT-Codex-Patched"
 # The original Store edition is unchanged and can be launched directly from the Start menu
 ```
 
+The Store build validates an ASAR header hash embedded in `ChatGPT.exe`. The
+workflow updates that hash only in the copied executable after repacking and
+gives the patched desktop shortcut a separate `--user-data-dir`, so an already
+running official instance cannot claim the patched copy's single-instance lock.
+Because the copied executable is modified, Windows may report its vendor
+signature as invalid; the official Store installation keeps its original
+signature and remains untouched.
+
 **Traditional Windows installation:**
 
 ```powershell

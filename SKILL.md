@@ -117,6 +117,16 @@ python3 patch.py
 > Automatically detect the Microsoft Store version (MSIX) or traditional installation. Read the MSIX entry point from `AppxManifest.xml` and verify the Codex resource marker.
 > Copy the ChatGPT-branded Store version to `%LOCALAPPDATA%\Programs\ChatGPT-Codex-Patched` without modifying the original, and create the desktop shortcut `ChatGPT Codex (Patched)`.
 
+The Store build embeds the SHA-256 hash of the original `app.asar` header in
+the Electron executable. Repacking without updating that embedded value causes
+Electron to exit immediately with `Integrity check failed for asar archive`.
+The workflow updates the hash only in the copied executable and gives the
+patched shortcut an independent `--user-data-dir` to avoid the official app's
+single-instance lock.
+Changing the copied executable also invalidates its original vendor
+Authenticode signature by design; the official Store installation is not
+modified and retains its signature.
+
 ---
 
 ## config.toml
@@ -258,6 +268,7 @@ grep -rn "enable_i18n" *.js
 |-----------|--------|----------|
 | Read the entry point from the manifest/plist | The ChatGPT display name, package identity, and executable name no longer match | Installation discovery |
 | Repack `app.asar` after extraction | The Owl runtime does not fall back to loading a loose `app/` directory | Resources directory |
+| Update the Windows embedded ASAR hash | Electron validates the repacked archive before starting the renderer | Copied `ChatGPT.exe` (Windows only) |
 | Preserve `.node` / native module sidecars | Electron must load native extensions from disk | `app.asar.unpacked` |
 | Update `ElectronAsarIntegrity` | Match the repacked ASAR header hash to `Info.plist` | `Info.plist` (macOS only) |
 | Apply an outer ad-hoc signature and strict verification | Allow the modified copy to launch while preserving internal OpenAI signatures | Final step (macOS only) |

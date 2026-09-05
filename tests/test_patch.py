@@ -737,7 +737,52 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
             command = run_cmd.call_args.args[0]
             self.assertEqual(command[:3], ["powershell", "-NoProfile", "-Command"])
             self.assertIn("$lnk.TargetPath='", command[3])
-            self.assertIn("$lnk.Arguments='';", command[3])
+            self.assertIn("$lnk.Arguments='--user-data-dir=\"", command[3])
+
+    def test_windows_asar_integrity_hash_updates_only_the_copy(self):
+        with loaded_patch_module() as patch_module, tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            resources = root / "resources"
+            resources.mkdir()
+
+            def write_asar(path, header):
+                string_pickle = struct.pack("<II", len(header) + 1, len(header))
+                string_pickle += header + b"\0"
+                string_pickle += b"\0" * (-len(string_pickle) % 4)
+                size_pickle = struct.pack("<II", 4, len(string_pickle))
+                path.write_bytes(size_pickle + string_pickle + b"x")
+
+            original_header = b'{"files":{"original.js":{"size":1,"offset":"0"}}}'
+            patched_header = b'{"files":{"patched.js":{"size":2,"offset":"0"}}}'
+            original_asar = resources / "app.asar.bak"
+            patched_asar = resources / "app.asar"
+            write_asar(original_asar, original_header)
+            write_asar(patched_asar, patched_header)
+            original_hash = patch_module._asar_header_hash(str(original_asar))
+            patched_hash = patch_module._asar_header_hash(str(patched_asar))
+            exe = root / "ChatGPT.exe"
+            exe.write_bytes(
+                b"prefix" + original_hash.encode("ascii") + b"middle" +
+                original_hash.encode("ascii") + b"suffix"
+            )
+
+            patch_module.DRY_RUN = False
+            patch_module.results = {"applied": [], "skipped": [], "failed": []}
+            with contextlib.redirect_stdout(io.StringIO()):
+                patch_module.step_update_windows_asar_integrity(
+                    str(exe), str(resources)
+                )
+            content = exe.read_bytes()
+            self.assertEqual(content.count(original_hash.encode("ascii")), 0)
+            self.assertEqual(content.count(patched_hash.encode("ascii")), 2)
+
+            first = content
+            patch_module.results = {"applied": [], "skipped": [], "failed": []}
+            with contextlib.redirect_stdout(io.StringIO()):
+                patch_module.step_update_windows_asar_integrity(
+                    str(exe), str(resources)
+                )
+            self.assertEqual(first, exe.read_bytes())
 
     def test_windows_shutdown_hides_missing_main_and_only_scans_patched_root(self):
         with loaded_patch_module() as patch_module:
@@ -988,6 +1033,65 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
             self.assertEqual(
                 contents,
                 {path.name: path.read_text("utf-8") for path in assets.glob("*.js")},
+            )
+
+    def test_26901_scopes_dictation_and_usage_patches_away_from_decoys(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets = Path(tmp)
+            write_supported_assets(assets)
+            dictation = assets / "app-initial-semantic.js"
+            dictation_source = (
+                "function Kjn(e,t){let n=t?.permissions,r=qjn(e,t,n==null||"
+                "n.includes(`voice`),{freePlanAllowed:!0});return "
+                "e.authMethod!==`chatgpt`&&r.status===`allowed`?"
+                "{status:`denied`,reason:`unsupported-auth`}:r}"
+            )
+            dictation.write_text(dictation_source, encoding="utf-8")
+            decoy = assets / "app-initial-decoy.js"
+            decoy_source = (
+                "const dictation=true;function decoy(){return enabled&&"
+                "auth.authMethod===`chatgpt`}"
+            )
+            decoy.write_text(decoy_source, encoding="utf-8")
+            usage = assets / "app-primary-semantic.js"
+            usage_source = (
+                "function pmn({authMethod:e,hasCreditBalance:t=!1,plan:i}){"
+                "let u=e===`chatgpt`,h=u&&t;"
+                "return{isUsageSettingsVisible:h}}"
+            )
+            usage.write_text(usage_source, encoding="utf-8")
+
+            result = self.run_patch(assets)
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertNotIn("[FAIL]", result.stdout)
+            self.assertIn("Dictation unlock (scoped regex)", result.stdout)
+            self.assertIn("Usage settings unlock (scoped regex)", result.stdout)
+            self.assertIn(
+                "e.authMethod!==`chatgpt`&&e.authMethod!==`apikey`&&"
+                "r.status===`allowed`",
+                dictation.read_text("utf-8"),
+            )
+            self.assertIn(
+                "let u=e===`chatgpt`||e===`apikey`,h=u&&t",
+                usage.read_text("utf-8"),
+            )
+            self.assertEqual(decoy_source, decoy.read_text("utf-8"))
+
+            patched = {
+                path.name: path.read_text("utf-8")
+                for path in assets.glob("*.js")
+            }
+            second = self.run_patch(assets)
+            self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+            self.assertIn("[SKIP] Dictation unlock", second.stdout)
+            self.assertIn("[SKIP] Usage settings unlock", second.stdout)
+            self.assertEqual(
+                patched,
+                {
+                    path.name: path.read_text("utf-8")
+                    for path in assets.glob("*.js")
+                },
             )
 
     def test_macos_detects_chatgpt_bundle_and_targets_independent_copy(self):
