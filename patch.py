@@ -524,6 +524,45 @@ def _single_patch_target(files, name, required=True):
     return None
 
 
+def _service_tier_gate_patterns():
+    """Return the original and API-key-enabled service-tier gate patterns."""
+    identifier = r'[a-zA-Z_$][a-zA-Z0-9_$]*'
+    original = re.compile(
+        rf'({identifier})=(?:true\|\|)?({identifier})\?\.authMethod===`chatgpt`,'
+        rf'({identifier})=\2\?\.authMethod\?\?null'
+    )
+    patched = re.compile(
+        rf'({identifier})=(?:true\|\|)?({identifier})\?\.authMethod===`apikey`\|\|'
+        rf'\2\?\.authMethod===`chatgpt`,'
+        rf'({identifier})=\2\?\.authMethod\?\?null'
+    )
+    return original, patched
+
+
+def _service_tier_gate_candidates(assets, require_semantic_marker=False):
+    """Find chunks containing a complete, semantically relevant gate."""
+    original, patched = _service_tier_gate_patterns()
+    candidates = []
+    weak_candidates = []
+    for fp in sorted(glob.glob(os.path.join(assets, "*.js"))):
+        with open(fp, encoding="utf-8") as fh:
+            content = fh.read()
+        if original.search(content) or patched.search(content):
+            if not require_semantic_marker:
+                candidates.append(fp)
+                continue
+            if ("isServiceTierAllowed" not in content and
+                    "canUseFastMode" not in content):
+                continue
+            if re.search(
+                    r'featureRequirements\?\.fast_mode|canUseFastMode',
+                    content):
+                candidates.append(fp)
+            else:
+                weak_candidates.append(fp)
+    return candidates or weak_candidates
+
+
 def _function_spans(content):
     """Yield minified named-function spans without attempting to parse JS."""
     identifier = r'[a-zA-Z_$][a-zA-Z0-9_$]*'
@@ -1448,33 +1487,57 @@ def step_patch_js(assets):
     # methods without changing the behavior for other authentication modes.
     # Older builds use use-is-fast-mode-enabled-*.js with canUseFastMode.
     print("  [Module 1] Fast mode and service tier")
-    files = _find(assets, "use-service-tier-settings-*.js")
+    files = []
+    for candidate_pattern in (
+            "use-service-tier-settings-*.js",
+            "use-is-fast-mode-enabled-*.js",
+    ):
+        named_files = _find(assets, candidate_pattern)
+        if not named_files:
+            continue
+        named_candidates = set(_service_tier_gate_candidates(assets))
+        files = [fp for fp in named_files if fp in named_candidates]
+        if files:
+            break
     if not files:
-        files = _find(assets, "use-is-fast-mode-enabled-*.js")
-    if not files:
-        for f in glob.glob(os.path.join(assets, "*.js")):
-            with open(f, encoding="utf-8") as fh:
-                c = fh.read()
-            if "isServiceTierAllowed" in c and "authMethod===`chatgpt`" in c:
-                files = [f]; break
+        # 26.915 moved the hook into app-initial-*.js while consumer chunks
+        # retained the same result/auth markers. Match the complete gate so a
+        # consumer chunk cannot be selected as the patch target.
+        files = _service_tier_gate_candidates(
+            assets, require_semantic_marker=True)
     fast_ui_fp = _single_patch_target(files, "Service tier authorization gate")
     if fast_ui_fp is not None:
         # Also recognize and normalize the older true|| patch form.
-        apply_patch(fast_ui_fp, "Service tier authorization gate",
-            None, None,
-            r'([a-zA-Z_$]+)=(?:true\|\|)?([a-zA-Z_$]+)\?\.'
-            r'authMethod===`chatgpt`,([a-zA-Z_$]+)=\2\?\.'
-            r'authMethod\?\?null',
-            lambda m: (
-                f"{m.group(1)}={m.group(2)}?.authMethod===`apikey`||"
-                f"{m.group(2)}?.authMethod===`chatgpt`,"
-                f"{m.group(3)}={m.group(2)}?.authMethod??null"
-            ),
-            skip_regex=(
-                r'=[a-zA-Z_$]+\?\.authMethod===`apikey`\|\|'
-                r'[a-zA-Z_$]+\?\.authMethod===`chatgpt`,'
-                r'[a-zA-Z_$]+=[a-zA-Z_$]+\?\.authMethod\?\?null'
-            ))
+        service_tier_original, service_tier_patched = (
+            _service_tier_gate_patterns()
+        )
+        with open(fast_ui_fp, encoding="utf-8") as fh:
+            service_tier_content = fh.read()
+        original_matches = list(
+            service_tier_original.finditer(service_tier_content)
+        )
+        patched_matches = list(
+            service_tier_patched.finditer(service_tier_content)
+        )
+        if len(original_matches) + len(patched_matches) != 1:
+            reason = "Target structure mismatch"
+            if len(original_matches) + len(patched_matches) > 1:
+                reason = (
+                    f"Found {len(original_matches) + len(patched_matches)} "
+                    "targets"
+                )
+            mark_missing(
+                "Service tier authorization gate", reason
+            )
+        else:
+            apply_patch(fast_ui_fp, "Service tier authorization gate",
+                None, None, service_tier_original.pattern,
+                lambda m: (
+                    f"{m.group(1)}={m.group(2)}?.authMethod===`apikey`||"
+                    f"{m.group(2)}?.authMethod===`chatgpt`,"
+                    f"{m.group(3)}={m.group(2)}?.authMethod??null"
+                ),
+                skip_regex=service_tier_patched.pattern)
 
     # In 26.707+, request construction applies a second chatgpt-only check.
     request_tier_files = _find(assets, "read-service-tier-for-request-*.js")

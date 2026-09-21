@@ -445,6 +445,51 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
             )
             self.assertEqual(asi_source, native_plugins.read_text("utf-8"))
 
+    def test_26915_service_tier_gate_uses_complete_assignment_scope(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets = Path(tmp)
+            fixture = write_supported_assets(assets)
+            fixture["service_tier"].unlink()
+            fixture["request_tier"].write_text(
+                "async function allowed(e,t){let method=await auth(e,t);"
+                "if(method!==`chatgpt`&&method!==`apikey`)return!1;return true}",
+                encoding="utf-8",
+            )
+
+            target = assets / "app-initial-26915-test.js"
+            target.write_text(
+                "function TRa(e){let n=vf(oD),r=e?.hostId??n,i=ZC(r),"
+                "a=i?.authMethod===`chatgpt`,o=i?.authMethod??null,s;"
+                "let{data:c,isPending:l}=bf(Ob,{authMethod:o,hostId:r}),"
+                "u=!!i?.isLoading||a&&l,"
+                "d=a&&!u&&c!=null&&c?.requirements?.featureRequirements?."
+                "fast_mode!==!1;"
+                "return{isServiceTierAllowed:d,isLoading:u}}",
+                encoding="utf-8",
+            )
+            decoy = assets / "app-primary-26915-test.js"
+            decoy_source = (
+                "function consumer(){let a=auth?.authMethod===`chatgpt`,"
+                "o=auth?.authMethod??null;"
+                "return{isServiceTierAllowed:a,o}}"
+            )
+            decoy.write_text(decoy_source, encoding="utf-8")
+
+            first = self.run_patch(assets)
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            self.assertNotIn("[FAIL] Service tier authorization gate", first.stdout)
+            self.assertIn(
+                "a=i?.authMethod===`apikey`||i?.authMethod===`chatgpt`",
+                target.read_text("utf-8"),
+            )
+            self.assertEqual(decoy_source, decoy.read_text("utf-8"))
+            self.assertIn("[SKIP] Fast request service tier gate", first.stdout)
+
+            second = self.run_patch(assets)
+            self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+            self.assertIn("[SKIP] Service tier authorization gate", second.stdout)
+            self.assertEqual(decoy_source, decoy.read_text("utf-8"))
+
     def test_26721_additional_models_filter_is_patched_idempotently(self):
         with tempfile.TemporaryDirectory() as tmp:
             assets = Path(tmp)
