@@ -2,7 +2,7 @@
 
 This project targets the Codex desktop app whose display name has been changed to **ChatGPT**. It unlocks the model list, reasoning effort levels, service tiers, and other features in API key mode.
 
-It has been verified with Windows Store version `26.707.3748.0` and the macOS app versions `26.707.31428` and `26.721.31836` (Apple Silicon). In these versions, the display name and primary entry point have changed to ChatGPT, while installation packages may still use the Codex name. The script supports both the old and new names.
+It has been verified with Windows Store versions `26.707.3748.0` and `26.930.4958.0`, and the macOS app versions `26.707.31428` and `26.721.31836` (Apple Silicon). In these versions, the display name and primary entry point have changed to ChatGPT, while installation packages may still use the Codex name. The script supports both the old and new names.
 
 ## Unlocked Features
 
@@ -30,7 +30,7 @@ It has been verified with Windows Store version `26.707.3748.0` and the macOS ap
 ```
 patch.py                  Main script: one-command workflow for both ChatGPT and Codex names (macOS / Windows)
 SKILL.md                  Full technical documentation, including the version-update troubleshooting guide
-tests/test_patch.py       Regression tests for 26.707/26.721 models, reasoning effort, Fast, Browser, CUA, and the macOS workflow
+tests/test_patch.py       Regression tests for models, reasoning effort, Fast (including 26.930 PAT gates), Browser, CUA, and platform workflows
 ```
 
 ## Usage
@@ -90,6 +90,8 @@ python3 patch.py --assets "$env:LOCALAPPDATA\Programs\ChatGPT-Codex-Patched\reso
 python3 patch.py --dry-run
 ```
 
+The complete dry run previews the workflow only; it does not validate patch compatibility because it skips copying and extracting the detected installation. Existing extracted files may belong to an older version. To inspect specific extracted assets without writing files, use `python3 patch.py --assets /path/to/webview/assets --dry-run`.
+
 ## Rollback
 
 **macOS:**
@@ -128,6 +130,10 @@ if (Test-Path app.asar.bak) { Copy-Item app.asar.bak app.asar -Force }
 
 Keep your existing API provider configuration. The patch does not hard-code model IDs or reasoning effort levels, and it does not depend on the legacy `features.enable_fast` setting. Models and reasoning effort levels come from the live app-server list. Options such as Max and Ultra appear only when the model explicitly declares support for them. Selecting Fast writes the `service_tier` setting used by the current version.
 
+Custom providers with `requires_openai_auth = false` can report no OpenAI account and a null authentication method. The reasoning-effort patch also recognizes this custom-provider state, so Max and Ultra are not hidden merely because there is no OpenAI login. Models that do not declare Ultra support still omit that option.
+
 ## Version Updates
 
 After ChatGPT Codex is updated, JavaScript filenames (including hash suffixes) and variable names may change. The script includes automatic fallback searches and usually adapts without modification. If a patch fails, see the **Version Update Troubleshooting Guide** in [SKILL.md](SKILL.md).
+
+For Nowledge MCP settings that disappear when a configuration manager rewrites Codex settings, see the [configuration persistence investigation](docs/nowledge-mcp-persistence.md). The application patch itself does not manage MCP credentials.

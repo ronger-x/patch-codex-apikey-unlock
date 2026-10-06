@@ -6,6 +6,7 @@ import importlib.util
 import io
 import json
 import plistlib
+import runpy
 import shutil
 import struct
 import subprocess
@@ -157,6 +158,185 @@ def loaded_patch_module():
 
 
 class ChatGPTCodexPatchTests(unittest.TestCase):
+    def test_full_dry_run_does_not_validate_stale_store_copy_assets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            local = Path(tmp)
+            store = local / "WindowsApps" / "OpenAI.Codex.NewVersion"
+            source = store / "app"
+            resources = source / "resources"
+            resources.mkdir(parents=True)
+            (source / "Codex.exe").touch()
+            (resources / "codex.exe").touch()
+            (resources / "app.asar").write_bytes(b"unvalidated new source archive")
+            (store / "AppxManifest.xml").write_text(
+                '<Package><Applications><Application Executable="app/Codex.exe" />'
+                '</Applications></Package>', encoding="utf-8",
+            )
+            stale_assets = (
+                local / "Programs" / "Codex-Patched" / "resources"
+                / "app" / "webview" / "assets"
+            )
+            stale_assets.mkdir(parents=True)
+            write_supported_assets(stale_assets)
+            before = {path: path.read_bytes() for path in local.rglob("*") if path.is_file()}
+
+            with (
+                mock.patch.object(sys, "argv", [str(PATCH_SCRIPT), "--dry-run"]),
+                mock.patch.object(sys, "platform", "win32"),
+                mock.patch.dict("os.environ", {"LOCALAPPDATA": tmp}),
+                mock.patch("subprocess.run", return_value=subprocess.CompletedProcess(
+                    args=[], returncode=0, stdout=str(store), stderr="",
+                )) as run,
+                contextlib.redirect_stdout(io.StringIO()) as output,
+            ):
+                workflow = runpy.run_path(str(PATCH_SCRIPT), run_name="__main__")
+
+            self.assertIn(str(store), output.getvalue())
+            self.assertIn("JS inspection skipped", output.getvalue())
+            self.assertIn("has not been validated", output.getvalue())
+            self.assertIn("--assets DIR --dry-run", output.getvalue())
+            self.assertEqual({"applied": [], "skipped": [], "failed": []}, workflow["results"])
+            self.assertEqual(
+                before,
+                {path: path.read_bytes() for path in local.rglob("*") if path.is_file()},
+            )
+            run.assert_called_once()
+            self.assertIn("Get-AppxPackage", run.call_args.args[0])
+
+    def test_assets_dry_run_inspects_selected_files_without_writing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets = Path(tmp)
+            write_supported_assets(assets)
+            before = {path: path.read_bytes() for path in assets.iterdir()}
+            with (
+                mock.patch.object(sys, "argv", [
+                    str(PATCH_SCRIPT), "--assets", str(assets), "--dry-run",
+                ]),
+                contextlib.redirect_stdout(io.StringIO()) as output,
+            ):
+                workflow = runpy.run_path(str(PATCH_SCRIPT), run_name="__main__")
+
+            self.assertTrue(workflow["results"]["applied"])
+            self.assertEqual([], workflow["results"]["failed"])
+            self.assertNotIn("JS inspection skipped", output.getvalue())
+            self.assertEqual(before, {path: path.read_bytes() for path in assets.iterdir()})
+
+    def test_custom_provider_reasoning_and_capability_upgrade(self):
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "Node.js is required for semantic tests")
+        with loaded_patch_module() as patch_module:
+            for declaration, previous in (
+                ("isCustomModelProvider:c=!1,", "original"),
+                ("isCustomModelProvider:c=false,", "api_only"),
+                ("isCustomModelProvider:c=!1,", "api_only_shadowed"),
+                ("isCustomModelProvider=!1,", "original"),
+            ):
+                with self.subTest(declaration=declaration, previous=previous), \
+                        tempfile.TemporaryDirectory() as tmp:
+                    assets = Path(tmp)
+                    fixture = write_supported_assets(assets)
+                    model_filter = fixture["model_filter"]
+                    source = fixture["model_filter_source"].split(
+                        "if(process.argv[2]", 1
+                    )[0].replace("models:o,useHiddenModels:s}){",
+                                 declaration + "models:o,useHiddenModels:s}){")
+                    source = source.replace(
+                        "}})}", "}});let p=a&&o.some(model=>"
+                        "model.supportedReasoningEfforts.some("
+                        "({reasoningEffort:effort})=>effort===`ultra`));"
+                        "return{hasModelSupportingUltraReasoningEffort:p}}"
+                    )
+                    if previous != "original":
+                        effort = "c" if previous.endswith("shadowed") else "effort"
+                        source = source.replace(
+                            "x=a?r.supportedReasoningEfforts:",
+                            "x=(e===`apikey`||a)?r.supportedReasoningEfforts:",
+                        ).replace(
+                            "({reasoningEffort:e})=>t(e)&&i.has(e))",
+                            f"({{reasoningEffort:{effort}}})=>t({effort})&&"
+                            f"(e===`apikey`||i.has({effort})))",
+                        )
+                    source += (
+                        "function probe(authMethod,custom,supported,includeUltra){"
+                        "shown=[];let info=filter({authMethod,availableModels:new Set(),"
+                        "enabledReasoningEfforts:new Set([`medium`]),"
+                        "includeUltraReasoningEffort:includeUltra,"
+                        "isCustomModelProvider:custom,models:[{model:`test`,"
+                        "hidden:false,supportedReasoningEfforts:supported.map("
+                        "reasoningEffort=>({reasoningEffort}))}],useHiddenModels:false});"
+                        "return{...info,efforts:shown[0].supportedReasoningEfforts.map("
+                        "({reasoningEffort})=>reasoningEffort)}}"
+                        "let observations=[];for(let method of [null,undefined,`apikey`,"
+                        "`chatgpt`,`copilot`,`amazonBedrock`,`personalAccessToken`,`unknown`])"
+                        "for(let custom of [false,true])for(let supported of [false,true])"
+                        "for(let includeUltra of [false,true])observations.push({"
+                        "method:String(method),custom,supported,includeUltra,"
+                        "...probe(method,custom,supported?[`medium`,`ultra`,`invalid`]:"
+                        "[`medium`,`invalid`],includeUltra)});"
+                        "console.log(JSON.stringify(observations));"
+                    )
+                    model_filter.write_text(source, encoding="utf-8")
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        self.assertTrue(patch_module.apply_reasoning_effort_filter_patch(
+                            model_filter, validate_only=True
+                        ))
+                        with mock.patch.object(patch_module, "DRY_RUN", True):
+                            self.assertTrue(
+                                patch_module.apply_reasoning_effort_filter_patch(model_filter)
+                            )
+                        self.assertEqual(source, model_filter.read_text("utf-8"))
+                        self.assertTrue(
+                            patch_module.apply_reasoning_effort_filter_patch(model_filter)
+                        )
+                        patched = model_filter.read_text("utf-8")
+                        self.assertTrue(
+                            patch_module.apply_reasoning_effort_filter_patch(model_filter)
+                        )
+                        self.assertEqual(patched, model_filter.read_text("utf-8"))
+                    result = subprocess.run(
+                        [node, str(model_filter)], capture_output=True, text=True,
+                        encoding="utf-8", check=False,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    for observation in json.loads(result.stdout):
+                        with self.subTest(observation=observation):
+                            unlocked = observation["method"] == "apikey" or (
+                                observation["method"] in ("null", "undefined") and
+                                observation["custom"]
+                            )
+                            self.assertEqual(
+                                observation["efforts"],
+                                ["medium", "ultra"] if unlocked and
+                                observation["supported"] else ["medium"],
+                            )
+                            self.assertEqual(
+                                observation["hasModelSupportingUltraReasoningEffort"],
+                                observation["supported"] and
+                                (unlocked or observation["includeUltra"]),
+                            )
+
+    def test_custom_provider_reasoning_rejects_shadowed_patched_alias(self):
+        with loaded_patch_module() as patch_module, tempfile.TemporaryDirectory() as tmp:
+            fixture = write_supported_assets(Path(tmp))
+            model_filter = fixture["model_filter"]
+            source = fixture["model_filter_source"].replace(
+                "models:o,useHiddenModels:s}){",
+                "isCustomModelProvider:c=!1,models:o,useHiddenModels:s}){",
+            ).replace(
+                "x=a?r.supportedReasoningEfforts:",
+                "x=(e===`apikey`||e==null&&c||a)?r.supportedReasoningEfforts:",
+            ).replace(
+                "({reasoningEffort:e})=>t(e)&&i.has(e))",
+                "({reasoningEffort:c})=>t(c)&&"
+                "(e===`apikey`||e==null&&c||i.has(c)))",
+            )
+            model_filter.write_text(source, encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertFalse(
+                    patch_module.apply_reasoning_effort_filter_patch(model_filter)
+                )
+            self.assertEqual(source, model_filter.read_text("utf-8"))
+
     def test_26707_model_reasoning_and_fast_gates_are_patched_idempotently(self):
         with tempfile.TemporaryDirectory() as tmp:
             assets = Path(tmp)
@@ -489,6 +669,111 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
             self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
             self.assertIn("[SKIP] Service tier authorization gate", second.stdout)
             self.assertEqual(decoy_source, decoy.read_text("utf-8"))
+
+    def test_26930_service_tier_preserves_personal_access_token_support(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets = Path(tmp)
+            fixture = write_supported_assets(assets)
+            ui = fixture["service_tier"]
+            ui.write_text(
+                "function allowed(method){let auth={authMethod:method},"
+                "gate=auth?.authMethod===`chatgpt`||"
+                "auth?.authMethod===`personalAccessToken`,"
+                "authMethod=auth?.authMethod??null;"
+                "return{isServiceTierAllowed:gate}}"
+                "console.log(JSON.stringify([`apikey`,`chatgpt`,"
+                "`personalAccessToken`,`copilot`,`amazonBedrock`,null].map("
+                "method=>allowed(method).isServiceTierAllowed)))",
+                encoding="utf-8",
+            )
+            request = fixture["request_tier"]
+            request.write_text(
+                "async function allowed(method){let n1=await method;"
+                "if(n1!==`chatgpt`&&n1!==`personalAccessToken`)return!1;"
+                "return true}"
+                "console.log(JSON.stringify(await Promise.all([`apikey`,"
+                "`chatgpt`,`personalAccessToken`,`copilot`,`amazonBedrock`,"
+                "null].map(allowed))))",
+                encoding="utf-8",
+            )
+            first = self.run_patch(assets)
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            self.assertNotIn("[FAIL]", first.stdout)
+            for target in (ui, request):
+                checked = subprocess.run(
+                    ["node", str(target)], capture_output=True, text=True,
+                    check=True, timeout=10,
+                )
+                self.assertEqual(
+                    [True, True, True, False, False, False],
+                    json.loads(checked.stdout),
+                )
+            patched = [target.read_bytes() for target in (ui, request)]
+            second = self.run_patch(assets)
+            self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+            self.assertIn("[SKIP] Service tier authorization gate", second.stdout)
+            self.assertIn("[SKIP] Fast request service tier gate", second.stdout)
+            self.assertEqual(patched, [target.read_bytes() for target in (ui, request)])
+
+    def test_large_generated_payloads_do_not_stall_semantic_patch_scans(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets = Path(tmp)
+            fixture = write_supported_assets(assets)
+            payload = "const payload=`" + "A" * (256 * 1024) + "`;"
+            ui = fixture["service_tier"]
+            ui.write_text(payload + ui.read_text("utf-8"), encoding="utf-8")
+            semantic = assets / "app-initial-payload.js"
+            semantic.write_text(
+                payload + "function dictation(e,r){return "
+                "e.authMethod!==`chatgpt`&&r.status===`allowed`?"
+                "{status:`denied`,reason:`unsupported-auth`}:r}"
+                "function locale(config1){let x2a=config1?.get(`enable_i18n`,!1);"
+                "return x2a}",
+                encoding="utf-8",
+            )
+            untouched = assets / "payload-only.js"
+            untouched.write_text(payload, encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, str(PATCH_SCRIPT), "--assets", str(assets)],
+                cwd=REPO_ROOT, capture_output=True, text=True, check=False,
+                timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertNotIn("[FAIL]", result.stdout)
+            self.assertIn("[OK]   Dictation unlock", result.stdout)
+            self.assertIn("[OK]   Force-enable i18n", result.stdout)
+            self.assertIn(
+                "x2a=true||config1?.get(`enable_i18n`,!1)",
+                semantic.read_text("utf-8"),
+            )
+            self.assertEqual(payload, untouched.read_text("utf-8"))
+
+    def test_26930_windows_taskbar_identity_uses_bootstrap_not_worker(self):
+        with loaded_patch_module() as patch_module, tempfile.TemporaryDirectory() as tmp:
+            main_build = Path(tmp)
+            bootstrap = main_build / "bootstrap-latest.js"
+            source = (
+                "function identity(flavor){switch(flavor){"
+                "case enum1.t.Prod:return`com.openai.codex`;"
+                "case enum1.t.Dev:return`com.openai.codex.dev`}}"
+                "electron.app.setAppUserModelId(identity(buildFlavor));"
+            )
+            bootstrap.write_text(source, encoding="utf-8")
+            worker = main_build / "worker.js"
+            decoy = source.split("electron.app")[0]
+            worker.write_text(decoy, encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()):
+                patch_module.apply_windows_app_user_model_id_patch(str(main_build))
+            self.assertIn(
+                "case enum1.t.Prod:return`com.openai.codex.patched`",
+                bootstrap.read_text("utf-8"),
+            )
+            self.assertEqual(decoy, worker.read_text("utf-8"))
+            patched = bootstrap.read_bytes()
+            with contextlib.redirect_stdout(io.StringIO()):
+                patch_module.apply_windows_app_user_model_id_patch(str(main_build))
+            self.assertEqual(patched, bootstrap.read_bytes())
+            self.assertFalse(patch_module.results["failed"])
 
     def test_26721_additional_models_filter_is_patched_idempotently(self):
         with tempfile.TemporaryDirectory() as tmp:

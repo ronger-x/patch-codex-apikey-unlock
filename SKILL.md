@@ -15,7 +15,7 @@ version: 4.4.0
 
 Remove desktop UI gates that still depend on ChatGPT sign-in context when using API key mode.
 
-Verified with Windows Store version `26.707.3748.0` and macOS app version `26.707.31428` (Apple Silicon). The display name and main entry point have changed to ChatGPT, but package names and directories may still use Codex. The script reads the MSIX manifest or macOS `Info.plist` as appropriate and retains fallback support for the old name.
+Verified with Windows Store versions `26.707.3748.0` and `26.930.4958.0`, and macOS app version `26.707.31428` (Apple Silicon). The display name and main entry point have changed to ChatGPT, but package names and directories may still use Codex. The script reads the MSIX manifest or macOS `Info.plist` as appropriate and retains fallback support for the old name.
 
 ### Unlocked Features
 
@@ -139,6 +139,8 @@ Preserve the existing API provider configuration. The patch does not hard-code m
 
 After ChatGPT Codex updates, both JS filenames (hash suffixes) and variable names may change. Use the following methods to locate each patch target.
 
+In Windows `26.930.4958.0`, Fast UI/request gates also accept `personalAccessToken`; preserve that branch when adding API key support. The taskbar identity helper moved into `bootstrap-*.js` and uses a nested flavor enum. Match the chunk containing `setAppUserModelId`, since `worker.js` contains a similar helper that must remain unchanged. Large generated JS payloads require literal prefilters and identifier boundaries to avoid excessive regex backtracking.
+
 ### General Search Strategy
 
 ```bash
@@ -173,6 +175,8 @@ grep -rl "enabledReasoningEfforts" *.js
 ```
 
 The full API key mode list appears in the Advanced/Effort menu. Options such as Max and Ultra appear only when the current model actually declares support. The simplified Power slider uses fixed combinations from the official app and is not modified by this patch.
+
+For a custom provider with `requires_openai_auth = false`, `account/read` can return `account: null` and `getAuthStatus` can return `authMethod: null`. The frontend preserves that null value. Reasoning unlocks must therefore also accept a null authentication method when `isCustomModelProvider` is true; an `authMethod === apikey` check alone leaves the experiment filters active. Preserve the original behavior for other authentication modes and for a null method without a custom provider.
 
 ### 3. Fast UI / Service Tier Gate
 

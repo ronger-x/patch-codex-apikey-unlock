@@ -10,6 +10,7 @@ TEXT_FILES = (
     ".gitignore",
     "README.md",
     "SKILL.md",
+    "docs/nowledge-mcp-persistence.md",
     "patch.py",
     "tests/test_patch.py",
     "tests/test_source_encoding.py",

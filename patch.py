@@ -528,12 +528,14 @@ def _service_tier_gate_patterns():
     """Return the original and API-key-enabled service-tier gate patterns."""
     identifier = r'[a-zA-Z_$][a-zA-Z0-9_$]*'
     original = re.compile(
-        rf'({identifier})=(?:true\|\|)?({identifier})\?\.authMethod===`chatgpt`,'
+        rf'(?<![a-zA-Z0-9_$])({identifier})=(?:true\|\|)?({identifier})\?\.authMethod===`chatgpt`'
+        rf'(?P<personal_access>\|\|\2\?\.authMethod===`personalAccessToken`)?,'
         rf'({identifier})=\2\?\.authMethod\?\?null'
     )
     patched = re.compile(
-        rf'({identifier})=(?:true\|\|)?({identifier})\?\.authMethod===`apikey`\|\|'
-        rf'\2\?\.authMethod===`chatgpt`,'
+        rf'(?<![a-zA-Z0-9_$])({identifier})=(?:true\|\|)?({identifier})\?\.authMethod===`apikey`\|\|'
+        rf'\2\?\.authMethod===`chatgpt`'
+        rf'(?:\|\|\2\?\.authMethod===`personalAccessToken`)?,'
         rf'({identifier})=\2\?\.authMethod\?\?null'
     )
     return original, patched
@@ -547,12 +549,18 @@ def _service_tier_gate_candidates(assets, require_semantic_marker=False):
     for fp in sorted(glob.glob(os.path.join(assets, "*.js"))):
         with open(fp, encoding="utf-8") as fh:
             content = fh.read()
+        # Large generated assets may contain megabytes of base64 or embedded
+        # source. Check literals before regex scanning, and do not retry the
+        # identifier pattern at every character of those payloads.
+        if "?.authMethod===`" not in content:
+            continue
+        if (require_semantic_marker and
+                "isServiceTierAllowed" not in content and
+                "canUseFastMode" not in content):
+            continue
         if original.search(content) or patched.search(content):
             if not require_semantic_marker:
                 candidates.append(fp)
-                continue
-            if ("isServiceTierAllowed" not in content and
-                    "canUseFastMode" not in content):
                 continue
             if re.search(
                     r'featureRequirements\?\.fast_mode|canUseFastMode',
@@ -848,19 +856,26 @@ def _desktop_main_build(assets):
 def apply_windows_app_user_model_id_patch(main_build):
     """Give the patched Windows copy a taskbar identity distinct from Store Codex."""
     identifier = r'[a-zA-Z_$][a-zA-Z0-9_$]*'
+    enum_reference = rf'{identifier}(?:\.{identifier})*'
     original = re.compile(
-        rf'case[ \t]+(?P<flavor>{identifier})\.Prod[ \t]*:[ \t]*'
+        rf'case[ \t]+(?P<flavor>{enum_reference})\.Prod[ \t]*:[ \t]*'
         r'return[ \t]*`com\.openai\.codex`'
     )
     patched = re.compile(
-        rf'case[ \t]+{identifier}\.Prod[ \t]*:[ \t]*'
+        rf'case[ \t]+{enum_reference}\.Prod[ \t]*:[ \t]*'
         r'return[ \t]*`com\.openai\.codex\.patched`'
     )
     candidates = []
     feature_present = False
-    for fp in _find(main_build, "file-based-logger-*.js"):
+    for fp in _find(main_build, "*.js"):
         with open(fp, encoding="utf-8") as fh:
             content = fh.read()
+        # 26.930 inlines the identity helper in bootstrap and also copies a
+        # similarly shaped log-directory helper into worker.js. Only follow
+        # chunks with the actual Electron identity call or the legacy module.
+        if (not os.path.basename(fp).startswith("file-based-logger-") and
+                "setAppUserModelId" not in content):
+            continue
         feature_present = (
             feature_present
             or (".Prod" in content and "com.openai.codex" in content)
@@ -1194,13 +1209,13 @@ def _patch_dictation_capability_gate(assets):
     """Patch the scoped voice/dictation capability gate used by newer builds."""
     identifier = r'[a-zA-Z_$][a-zA-Z0-9_$]*'
     original = re.compile(
-        rf'(?P<auth>{identifier})\.authMethod!==`chatgpt`&&'
+        rf'(?<![a-zA-Z0-9_$])(?P<auth>{identifier})\.authMethod!==`chatgpt`&&'
         rf'(?P<status>{identifier})\.status===`allowed`\?'
         rf'\{{status:`denied`,reason:`unsupported-auth`\}}:'
         rf'(?P=status)'
     )
     patched = re.compile(
-        rf'(?P<auth>{identifier})\.authMethod!==`chatgpt`&&'
+        rf'(?<![a-zA-Z0-9_$])(?P<auth>{identifier})\.authMethod!==`chatgpt`&&'
         rf'(?P=auth)\.authMethod!==`apikey`&&'
         rf'(?P<status>{identifier})\.status===`allowed`\?'
         rf'\{{status:`denied`,reason:`unsupported-auth`\}}:'
@@ -1210,6 +1225,8 @@ def _patch_dictation_capability_gate(assets):
     for fp in glob.glob(os.path.join(assets, "*.js")):
         with open(fp, encoding="utf-8") as fh:
             content = fh.read()
+        if "reason:`unsupported-auth`" not in content:
+            continue
         original_matches = list(original.finditer(content))
         patched_matches = list(patched.finditer(content))
         if original_matches or patched_matches:
@@ -1335,7 +1352,8 @@ def apply_reasoning_effort_filter_patch(fp, validate_only=False):
     def field_alias(fields, field):
         match = re.search(
             rf'(?:^|,)[ \t]*{re.escape(field)}'
-            rf'(?::(?P<alias>{identifier}))?[ \t]*(?=,|$)',
+            rf'(?::(?P<alias>{identifier}))?[ \t]*'
+            rf'(?:=[ \t]*(?:!0|!1|true|false))?[ \t]*(?=,|$)',
             fields,
         )
         return (match.group("alias") or field) if match is not None else None
@@ -1354,6 +1372,14 @@ def apply_reasoning_effort_filter_patch(fp, validate_only=False):
             for field in required_fields
         }
         if all(aliases.values()):
+            aliases["isCustomModelProvider"] = field_alias(
+                match.group("fields"), "isCustomModelProvider"
+            )
+            if (re.search(r'(?:^|,)\s*isCustomModelProvider\b',
+                          match.group("fields")) and
+                    aliases["isCustomModelProvider"] is None):
+                mark_missing(patch_name, "Target structure mismatch")
+                return False
             target_signatures.append((match, aliases))
     if len(target_signatures) != 1:
         mark_missing(patch_name, "Target structure mismatch")
@@ -1369,6 +1395,15 @@ def apply_reasoning_effort_filter_patch(fp, validate_only=False):
     auth = aliases["authMethod"]
     enabled = aliases["enabledReasoningEfforts"]
     ultra_gate = aliases["includeUltraReasoningEffort"]
+    custom_provider = aliases["isCustomModelProvider"]
+    # Custom API providers can deliberately require no OpenAI account. In that
+    # case account/read maps to a null auth method, even with valid provider auth.
+    unlock = f"{auth}===`apikey`"
+    optional_custom = ""
+    if custom_provider is not None:
+        custom_unlock = f"{auth}==null&&{custom_provider}"
+        unlock += f"||{custom_unlock}"
+        optional_custom = rf'(?P<custom>{re.escape(custom_unlock)}\|\|)?'
 
     ultra_original = re.compile(
         rf'(?P<target>{identifier})={re.escape(ultra_gate)}\?'
@@ -1379,7 +1414,7 @@ def apply_reasoning_effort_filter_patch(fp, validate_only=False):
     )
     ultra_patched = re.compile(
         rf'(?P<target>{identifier})=\({re.escape(auth)}===`apikey`\|\|'
-        rf'{re.escape(ultra_gate)}\)\?(?P<model>{identifier})\.'
+        rf'{optional_custom}{re.escape(ultra_gate)}\)\?(?P<model>{identifier})\.'
         r'supportedReasoningEfforts:(?P=model)\.supportedReasoningEfforts\.'
         r'filter\(\(\{reasoningEffort:(?P<effort>'
         rf'{identifier})\}}\)=>(?P=effort)!==`ultra`\)'
@@ -1396,9 +1431,37 @@ def apply_reasoning_effort_filter_patch(fp, validate_only=False):
         rf'(?P<efforts>{identifier})\))\.filter\(\(\{{'
         rf'reasoningEffort:(?P<effort>{identifier})\}}\)=>'
         rf'(?P<validator>{identifier})\((?P=effort)\)&&\('
-        rf'{re.escape(auth)}===`apikey`\|\|{re.escape(enabled)}\.'
+        rf'{re.escape(auth)}===`apikey`\|\|{optional_custom}'
+        rf'{re.escape(enabled)}\.'
         r'has\((?P=effort)\)\)\)'
     )
+    # Newer builds also expose this capability to the Model features settings.
+    # Preserve its model-support check; only widen the same account gate.
+    summary_match = None
+    summary_pattern = None
+    summary_properties = list(re.finditer(
+        rf'hasModelSupportingUltraReasoningEffort:(?P<alias>{identifier})(?=[,}}])',
+        scope,
+    ))
+    if "hasModelSupportingUltraReasoningEffort" in scope:
+        if len(summary_properties) != 1:
+            mark_missing(patch_name, "Target structure mismatch")
+            return False
+        summary_alias = summary_properties[0].group("alias")
+        summary_pattern = re.compile(
+            rf'(?<![a-zA-Z0-9_$]){re.escape(summary_alias)}='
+            rf'(?P<gate>{re.escape(ultra_gate)}|\({re.escape(auth)}===`apikey`'
+            rf'\|\|{optional_custom}{re.escape(ultra_gate)}\))&&'
+            rf'{identifier}\.some\((?P<model>{identifier})=>'
+            r'(?P=model)\.supportedReasoningEfforts\.some\(\(\{'
+            rf'reasoningEffort:(?P<effort>{identifier})\}}\)=>'
+            r'(?P=effort)===`ultra`\)\)'
+        )
+        summary_matches = list(summary_pattern.finditer(scope))
+        if len(summary_matches) != 1:
+            mark_missing(patch_name, "Target structure mismatch")
+            return False
+        summary_match = summary_matches[0]
 
     ultra_original_matches = list(ultra_original.finditer(scope))
     ultra_patched_matches = list(ultra_patched.finditer(scope))
@@ -1420,28 +1483,40 @@ def apply_reasoning_effort_filter_patch(fp, validate_only=False):
             enabled,
             enabled_match.group("validator"),
         }
+        if enabled_match.groupdict().get("custom"):
+            shadowed_names.add(custom_provider)
         if enabled_match.group("effort") in shadowed_names:
             mark_missing(patch_name, "Target structure mismatch")
             return False
     if validate_only:
         return True
-    if ultra_patched_matches and enabled_patched_matches:
+    ultra_complete = bool(ultra_patched_matches) and (
+        custom_provider is None or ultra_match.groupdict().get("custom")
+    )
+    enabled_complete = bool(enabled_patched_matches) and (
+        custom_provider is None or enabled_match.groupdict().get("custom")
+    )
+    summary_gate = f"({unlock}||{ultra_gate})"
+    summary_complete = (
+        summary_match is None or summary_match.group("gate") == summary_gate
+    )
+    if ultra_complete and enabled_complete and summary_complete:
         results["skipped"].append(patch_name)
         print("    [SKIP] Reasoning effort list unlock")
         return True
 
     edits = []
-    if ultra_original_matches:
+    if not ultra_complete:
         model = ultra_match.group("model")
         effort = ultra_match.group("effort")
         replacement = (
-            f"{ultra_match.group('target')}=({auth}===`apikey`||{ultra_gate})?"
+            f"{ultra_match.group('target')}=({unlock}||{ultra_gate})?"
             f"{model}.supportedReasoningEfforts:"
             f"{model}.supportedReasoningEfforts.filter("
             f"({{reasoningEffort:{effort}}})=>{effort}!==`ultra`)"
         )
         edits.append((ultra_match.start(), ultra_match.end(), replacement))
-    if enabled_original_matches:
+    if not enabled_complete:
         used_identifiers = set(re.findall(identifier, scope))
         patched_effort = "__codexReasoningEffort"
         suffix = 2
@@ -1452,9 +1527,12 @@ def apply_reasoning_effort_filter_patch(fp, validate_only=False):
             f"{enabled_match.group('prefix')}.filter("
             f"({{reasoningEffort:{patched_effort}}})=>"
             f"{enabled_match.group('validator')}({patched_effort})&&"
-            f"({auth}===`apikey`||{enabled}.has({patched_effort})))"
+            f"({unlock}||{enabled}.has({patched_effort})))"
         )
         edits.append((enabled_match.start(), enabled_match.end(), replacement))
+    if not summary_complete:
+        edits.append((summary_match.start("gate"), summary_match.end("gate"),
+                      summary_gate))
 
     patched_scope = scope
     for start, end, replacement in sorted(edits, reverse=True):
@@ -1462,7 +1540,13 @@ def apply_reasoning_effort_filter_patch(fp, validate_only=False):
     if (ultra_original.search(patched_scope) is not None or
             enabled_original.search(patched_scope) is not None or
             len(list(ultra_patched.finditer(patched_scope))) != 1 or
-            len(list(enabled_patched.finditer(patched_scope))) != 1):
+            len(list(enabled_patched.finditer(patched_scope))) != 1 or
+            (custom_provider is not None and (
+                not ultra_patched.search(patched_scope).group("custom") or
+                not enabled_patched.search(patched_scope).group("custom"))) or
+            (summary_pattern is not None and (
+                len(list(summary_pattern.finditer(patched_scope))) != 1 or
+                summary_pattern.search(patched_scope).group("gate") != summary_gate))):
         mark_missing(patch_name, "Post-patch validation failed")
         return False
 
@@ -1534,8 +1618,9 @@ def step_patch_js(assets):
                 None, None, service_tier_original.pattern,
                 lambda m: (
                     f"{m.group(1)}={m.group(2)}?.authMethod===`apikey`||"
-                    f"{m.group(2)}?.authMethod===`chatgpt`,"
-                    f"{m.group(3)}={m.group(2)}?.authMethod??null"
+                    f"{m.group(2)}?.authMethod===`chatgpt`"
+                    f"{m.group('personal_access') or ''},"
+                    f"{m.group(4)}={m.group(2)}?.authMethod??null"
                 ),
                 skip_regex=service_tier_patched.pattern)
 
@@ -1553,9 +1638,15 @@ def step_patch_js(assets):
     if request_tier_fp is not None:
         apply_patch(request_tier_fp, "Fast request service tier gate",
             None, None,
-            r'if\(([a-zA-Z_$]+)!==`chatgpt`\)return!1;',
-            lambda m: f"if({m.group(1)}!==`chatgpt`&&{m.group(1)}!==`apikey`)return!1;",
-            skip_regex=r'if\(([a-zA-Z_$]+)!==`chatgpt`&&\1!==`apikey`\)return!1;')
+            r'if\(([a-zA-Z_$][a-zA-Z0-9_$]*)!==`chatgpt`'
+            r'(?P<personal_access>&&\1!==`personalAccessToken`)?\)return!1;',
+            lambda m: (
+                f"if({m.group(1)}!==`chatgpt`&&{m.group(1)}!==`apikey`"
+                f"{m.group('personal_access') or ''})return!1;"
+            ),
+            skip_regex=(
+                r'if\(([a-zA-Z_$][a-zA-Z0-9_$]*)!==`chatgpt`&&\1!==`apikey`'
+                r'(?:&&\1!==`personalAccessToken`)?\)return!1;'))
 
     # -- Module 2: latest models and reasoning efforts (2 patches) ------
     # API key sessions do not receive the ChatGPT Statsig hidden-model
@@ -1629,16 +1720,20 @@ def step_patch_js(assets):
     # r=(0,Q.useMemo)(()=>n?.get(`enable_i18n`,!1),[n]). The old
     # pluginsDisabledTooltip gate was removed; module 4 handles its successor.
     print("\n  [Module 3] i18n")
+    i18n_identifier = r'[a-zA-Z_$][a-zA-Z0-9_$]*'
     i18n_target = re.compile(
-        r'[a-zA-Z_$]+=[a-zA-Z_$]+\?\.get\(`enable_i18n`,!1\)'
+        rf'(?<![a-zA-Z0-9_$]){i18n_identifier}={i18n_identifier}'
+        r'\?\.get\(`enable_i18n`,!1\)'
     )
     i18n_patched = re.compile(
-        r'=true\|\|[a-zA-Z_$]+\?\.get\(`enable_i18n`,!1\)'
+        rf'=true\|\|{i18n_identifier}\?\.get\(`enable_i18n`,!1\)'
     )
     files = []
     for fp in glob.glob(os.path.join(assets, "*.js")):
         with open(fp, encoding="utf-8") as fh:
             content = fh.read()
+        if "`enable_i18n`" not in content:
+            continue
         if i18n_target.search(content) or i18n_patched.search(content):
             files.append(fp)
     i18n_fp = _single_patch_target(
@@ -1646,9 +1741,10 @@ def step_patch_js(assets):
     if i18n_fp is not None:
         apply_patch(i18n_fp, "Force-enable i18n",
             None, None,
-            r'([a-zA-Z_$]+)=([a-zA-Z_$]+)\?\.get\(`enable_i18n`,!1\)',
+            rf'(?<![a-zA-Z0-9_$])({i18n_identifier})=({i18n_identifier})'
+            r'\?\.get\(`enable_i18n`,!1\)',
             lambda m: f"{m.group(1)}=true||{m.group(2)}?.get(`enable_i18n`,!1)",
-            skip_regex=r'=true\|\|[a-zA-Z_$]+\?\.get\(`enable_i18n`,!1\)')
+            skip_regex=i18n_patched.pattern)
 
     # -- Module 4: Browser / Computer Use (5 patches) ------------------
     # API key sessions lack a ChatGPT Statsig user context, so three desktop
@@ -2243,8 +2339,11 @@ else:
     step_extract_asar(resources_dir)
 
     assets = os.path.join(resources_dir, "app", "webview", "assets")
-    if DRY_RUN and not os.path.isdir(assets):
-        print("[5] [DRY-RUN] Target copy does not exist; JS inspection skipped")
+    if DRY_RUN:
+        # Copying/extraction was skipped, so existing assets may belong to an
+        # older installation and cannot validate the detected source archive.
+        print("[5] [DRY-RUN] JS inspection skipped; source archive was not extracted")
+        print("    To inspect extracted assets, run with --assets DIR --dry-run.")
     else:
         if not os.path.isdir(assets):
             _die(f"Assets directory not found: {assets}")
@@ -2295,6 +2394,7 @@ if results["failed"]:
 print()
 if not args.assets and DRY_RUN:
     print("  Dry run complete: no processes stopped and no files copied or packed.")
+    print("  Patch compatibility with the detected installation has not been validated.")
 elif not args.assets:
     if IS_WINDOWS and is_store:
         shortcut_name = (
