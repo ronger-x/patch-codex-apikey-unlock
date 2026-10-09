@@ -360,14 +360,23 @@ def step_copy_store(store_root):
 
     # /COPY:DAT copies data, attributes, and timestamps while omitting EFS
     # encryption attributes that cannot be copied from WindowsApps.
-    # /NP suppresses noisy percentages but retains file and directory listings.
+    # Capture robocopy output.  Even with /NP, /NDL, /NJH and /NJS, robocopy
+    # still emits one line per copied file; a Store install contains thousands
+    # of files and flooding the terminal can make the workflow look hung (or
+    # cause an embedding runner to truncate/abort the process).  Capturing also
+    # preserves the output for the failure path below.
     print("    Copying; this may take 1-2 minutes...")
-    rc, _ = run_cmd(
+    rc, output = run_cmd(
         ["robocopy", src, patch_root,
-         "/E", "/COPY:DAT", "/NP", "/NDL", "/NJH", "/NJS"]
+         "/E", "/COPY:DAT", "/NP", "/NDL", "/NJH", "/NJS"],
+        capture=True,
     )
     if rc >= 8:
-        _die(f"robocopy failed (exit {rc}); run this script as administrator.")
+        detail = f"\n{output}" if output else ""
+        _die(
+            f"robocopy failed (exit {rc}); run this script as administrator."
+            f"{detail}"
+        )
 
     print("    Copy complete.")
     return patch_root, resources, exe
@@ -1034,7 +1043,8 @@ def _native_apikey_plugins_file(assets):
     return None
 
 
-def _model_visibility_pattern(auth, use_hidden, custom_provider=None):
+def _model_visibility_pattern(
+        auth, use_hidden, custom_provider=None, api_key_daybreak=None):
     identifier = r'[a-zA-Z_$][a-zA-Z0-9_$]*'
     mode = identifier
     if custom_provider is not None:
@@ -1044,10 +1054,21 @@ def _model_visibility_pattern(auth, use_hidden, custom_provider=None):
             rf'{re.escape(auth)}[ \t]*!==[ \t]*`amazonBedrock`'
         )
         mode = rf'(?:{current_mode}|{identifier})'
+    daybreak_access = ""
+    if api_key_daybreak is not None:
+        # 26.1002 adds an API-key Daybreak exception to the allowlist arm.
+        # Match that exact expression so the whole visibility ternary can be
+        # bypassed without removing the outer access-program restriction.
+        daybreak_access = (
+            rf'(?:\|\|{re.escape(auth)}===`apikey`&&'
+            rf'{re.escape(api_key_daybreak)}&&!(?P=model)\.hidden&&'
+            rf'(?P<access>{identifier})\?\.some\('
+            rf'(?P<program>{identifier})=>(?P=program)!==`standard`\)===!0)?'
+        )
     return re.compile(
         rf'(?P<mode>{mode})[ \t]*\?[ \t]*'
         rf'(?P<allowed>{identifier})\.has\('
-        rf'(?P<model>{identifier})\.model\)[ \t]*:[ \t]*'
+        rf'(?P<model>{identifier})\.model\){daybreak_access}[ \t]*:[ \t]*'
         rf'!(?P=model)\.hidden'
     )
 
@@ -1082,17 +1103,39 @@ def _model_filter_signature(content, bn, patch_name, required_fields):
                  "isCustomModelProvider")
                 if custom_provider_match is not None else None
             )
+            daybreak_match = re.search(
+                rf'(?:^|,)[ \t]*apiKeyDaybreakSupported'
+                rf'(?::(?P<alias>{identifier}))?'
+                rf'(?:=[^,]*)?[ \t]*(?=,|$)',
+                fields,
+            )
+            aliases["apiKeyDaybreakSupported"] = (
+                (daybreak_match.group("alias") or
+                 "apiKeyDaybreakSupported")
+                if daybreak_match is not None else None
+            )
             scope_end = _js_block_end(content, signature_match.end() - 1)
             if scope_end is None:
                 continue
+            function_body = content[signature_match.end():scope_end]
             visibility_pattern = _model_visibility_pattern(
                 aliases["authMethod"],
                 aliases["useHiddenModels"],
                 aliases["isCustomModelProvider"],
+                aliases["apiKeyDaybreakSupported"],
             )
-            if visibility_pattern.search(
-                content[signature_match.end():scope_end]
-            ) is not None:
+            visibility_match = visibility_pattern.search(function_body)
+            if visibility_match is not None:
+                access = visibility_match.groupdict().get("access")
+                if access is not None:
+                    model = visibility_match.group("model")
+                    access_declaration = re.compile(
+                        rf'(?:let|const|var)[ \t]+{re.escape(access)}'
+                        rf'[ \t]*=[ \t]*{re.escape(model)}\.'
+                        r'availableAccessPrograms\?\.cyber(?=[,;])'
+                    )
+                    if access_declaration.search(function_body) is None:
+                        continue
                 target_signatures.append((signature_match, aliases))
 
     if len(target_signatures) != 1:
@@ -1129,6 +1172,7 @@ def apply_model_filter_patch(fp):
         auth,
         aliases["useHiddenModels"],
         aliases["isCustomModelProvider"],
+        aliases["apiKeyDaybreakSupported"],
     )
     patched_pattern = re.compile(
         rf'{re.escape(auth)}===`apikey`\|\|\((?P<visibility>'

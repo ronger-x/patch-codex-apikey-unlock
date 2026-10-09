@@ -953,6 +953,88 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
             self.assertIn("[SKIP] Hidden model list unlock", second.stdout)
             self.assertEqual(patched_source, model_filter.read_text("utf-8"))
 
+    def test_261002_daybreak_model_visibility_preserves_access_restrictions(self):
+        with loaded_patch_module() as patch_module, tempfile.TemporaryDirectory() as tmp:
+            model_filter = Path(tmp) / "app-initial-current.js"
+            model_filter.write_text(
+                "let shown=[];"
+                "function visible({additionalAvailableModels:e,"
+                "apiKeyDaybreakSupported:t=false,authMethod:n,"
+                "availableModels:r,hasConfiguredModelCatalog:i,"
+                "isCustomModelProvider:a=false,model:o,useHiddenModels:s}){"
+                "let c=o.availableAccessPrograms?.cyber;"
+                "return n===`apikey`&&!t&&c!=null&&c.length>0&&"
+                "!c.includes(`standard`)?!1:e?.has(o.model)===!0||"
+                "o.model!==`codex-auto-review`&&(i&&!o.hidden||"
+                "(s&&!a&&n!==`amazonBedrock`?r.has(o.model)||"
+                "n===`apikey`&&t&&!o.hidden&&"
+                "c?.some(e=>e!==`standard`)===!0:!o.hidden))}"
+                "function count(authMethod,apiKeyDaybreakSupported,model){"
+                "shown=[];if(visible({additionalAvailableModels:new Set(),"
+                "apiKeyDaybreakSupported,authMethod,availableModels:new Set(),"
+                "hasConfiguredModelCatalog:false,isCustomModelProvider:false,"
+                "model,useHiddenModels:false}))shown.push(model);"
+                "return shown.length}"
+                "if(process.argv[2]===`--verify`){"
+                "let hidden={model:`hidden`,hidden:true};"
+                "let restricted={model:`restricted`,hidden:true,"
+                "availableAccessPrograms:{cyber:[`research`]}};"
+                "let standard={model:`standard`,hidden:true,"
+                "availableAccessPrograms:{cyber:[`standard`]}};"
+                "console.log(JSON.stringify({"
+                "apikeyHidden:count(`apikey`,false,hidden),"
+                "apikeyRestricted:count(`apikey`,false,restricted),"
+                "apikeyDaybreak:count(`apikey`,true,restricted),"
+                "apikeyStandard:count(`apikey`,false,standard),"
+                "chatgptHidden:count(`chatgpt`,false,hidden),"
+                "autoReview:count(`apikey`,false,{model:`codex-auto-review`,"
+                "hidden:true})}))}",
+                encoding="utf-8",
+            )
+            patch_module.DRY_RUN = False
+            patch_module.results = {"applied": [], "skipped": [], "failed": []}
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                patch_module.apply_model_filter_patch(str(model_filter))
+
+            self.assertEqual([], patch_module.results["failed"])
+            self.assertEqual(1, len(patch_module.results["applied"]))
+            patched = model_filter.read_text("utf-8")
+            self.assertIn(
+                "n===`apikey`||(s&&!a&&n!==`amazonBedrock`?",
+                patched,
+            )
+
+            node = shutil.which("node")
+            if node is None:
+                self.fail("Node.js is required for hidden-model semantic tests")
+            checked = subprocess.run(
+                [node, str(model_filter), "--verify"],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            self.assertEqual(checked.returncode, 0, checked.stdout + checked.stderr)
+            self.assertEqual(
+                json.loads(checked.stdout),
+                {
+                    "apikeyHidden": 1,
+                    "apikeyRestricted": 0,
+                    "apikeyDaybreak": 1,
+                    "apikeyStandard": 1,
+                    "chatgptHidden": 0,
+                    "autoReview": 0,
+                },
+            )
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                patch_module.apply_model_filter_patch(str(model_filter))
+            self.assertEqual(patched, model_filter.read_text("utf-8"))
+            self.assertEqual(1, len(patch_module.results["skipped"]))
+
     def test_desktop_gate_patch_migrates_shadowing_pr5_form(self):
         with tempfile.TemporaryDirectory() as tmp:
             assets = Path(tmp)
@@ -1247,6 +1329,34 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
             run_cmd.assert_not_called()
             self.assertIn("Unable to remove the old patched directory", output.getvalue())
             self.assertIn("Computer Use", output.getvalue())
+
+    def test_windows_store_copy_captures_robocopy_output(self):
+        with loaded_patch_module() as patch_module, tempfile.TemporaryDirectory() as tmp:
+            patch_module.DRY_RUN = False
+            store_root = str(Path(tmp) / "WindowsApps" / "OpenAI.Codex")
+            source_root = str(Path(store_root) / "app")
+            source_exe = str(Path(source_root) / "ChatGPT.exe")
+
+            with (
+                mock.patch.dict(patch_module.os.environ, {"LOCALAPPDATA": tmp}),
+                mock.patch.object(
+                    patch_module,
+                    "_store_app_details",
+                    return_value=(
+                        source_root,
+                        str(Path(source_root) / "resources"),
+                        source_exe,
+                    ),
+                ),
+                mock.patch.object(
+                    patch_module, "run_cmd", return_value=(1, "copied files")
+                ) as run_cmd,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                patch_module.step_copy_store(store_root)
+
+            run_cmd.assert_called_once()
+            self.assertTrue(run_cmd.call_args.kwargs["capture"])
 
     def test_current_desktop_feature_marker_drift_fails_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
