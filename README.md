@@ -2,7 +2,7 @@
 
 This project targets the Codex desktop app whose display name has been changed to **ChatGPT**. It unlocks the model list, reasoning effort levels, service tiers, and other features in API key mode.
 
-It has been verified with Windows Store versions `26.707.3748.0` and `26.930.4958.0`, and the macOS app versions `26.707.31428` and `26.721.31836` (Apple Silicon). In these versions, the display name and primary entry point have changed to ChatGPT, while installation packages may still use the Codex name. The script supports both the old and new names.
+It has been verified with Windows Store versions `26.707.3748.0`, `26.930.4958.0`, and `26.1007.9446.0`, and the macOS app versions `26.707.31428` and `26.721.31836` (Apple Silicon). In these versions, the display name and primary entry point have changed to ChatGPT, while installation packages may still use the Codex name. The script supports both the old and new names.
 
 ## Unlocked Features
 
@@ -10,7 +10,7 @@ It has been verified with Windows Store versions `26.707.3748.0` and `26.930.495
 |---------|-------------|
 | Latest model list | Shows models returned by app-server that are marked as hidden by default |
 | Hidden reasoning effort options | In API key mode, shows every reasoning effort level that the model actually supports but the ChatGPT experiment configuration hides |
-| Fast/Speed mode | Removes the `chatgpt` login restriction from both the UI and the actual request path |
+| Fast/Speed mode | Enables API key and no-login custom-provider sessions in both the UI and request path while preserving model support and server restrictions |
 | Plugins marketplace | Supports the legacy gate; automatically skips the patch when a newer version natively supports API keys |
 | Browser / Chrome | Removes the desktop availability gate caused by missing Statsig context in API key mode while preserving real platform and app-server capability checks |
 | Computer Use | Enables desktop availability and the Node runtime; on macOS, uses the separately packaged helper service signed by OpenAI |
@@ -30,7 +30,7 @@ It has been verified with Windows Store versions `26.707.3748.0` and `26.930.495
 ```
 patch.py                  Main script: one-command workflow for both ChatGPT and Codex names (macOS / Windows)
 SKILL.md                  Full technical documentation, including the version-update troubleshooting guide
-tests/test_patch.py       Regression tests for models, reasoning effort, Fast (including 26.930 PAT gates), Browser, CUA, and platform workflows
+tests/test_patch.py       Regression tests for models, reasoning effort, Fast (including 26.1007 custom providers), Browser, CUA, and platform workflows
 ```
 
 ## Usage
@@ -132,8 +132,14 @@ Keep your existing API provider configuration. The patch does not hard-code mode
 
 Custom providers with `requires_openai_auth = false` can report no OpenAI account and a null authentication method. The reasoning-effort patch also recognizes this custom-provider state, so Max and Ultra are not hidden merely because there is no OpenAI login. Models that do not declare Ultra support still omit that option.
 
+Fast also recognizes this state: the UI accepts `authMethod == null` only when `requiresAuth === false`, and the request path checks `account == null` together with `requiresOpenaiAuth === false`. Fast still requires a matching entry in the model's `serviceTiers` and server permission from `configRequirements/read`. A model without Fast support, or a server response with `fast_mode: false`, keeps the option unavailable.
+
 ## Version Updates
 
 After ChatGPT Codex is updated, JavaScript filenames (including hash suffixes) and variable names may change. The script includes automatic fallback searches and usually adapts without modification. If a patch fails, see the **Version Update Troubleshooting Guide** in [SKILL.md](SKILL.md).
+
+Windows Store `26.1007.9446.0` returns a `serviceTierAccess` map instead of the older `isServiceTierAllowed` flag, and its request gate returns `null` instead of `false`. The adapter handles both forms and upgrades earlier API-key-only Fast patches to include no-login custom providers. After updating, run the complete `python patch.py` workflow and relaunch `ChatGPT Codex (Patched)`; `--assets` alone leaves the runtime's `app.asar` unchanged.
+
+Validation on 2026-10-15 passed 36 tests and 467 subtests. The full Windows rebuild applied 12 patches with no failures, and archive contents, the embedded ASAR hash, and basic startup checks passed. Executing the patched UI and request functions with local app-server responses confirmed Fast access for the custom-provider state and rejection when the server disables Fast; this check does not measure response speed or send a billable model request.
 
 For Nowledge MCP settings that disappear when a configuration manager rewrites Codex settings, see the [configuration persistence investigation](docs/nowledge-mcp-persistence.md). The application patch itself does not manage MCP credentials.

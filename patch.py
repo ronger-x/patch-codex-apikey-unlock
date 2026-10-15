@@ -537,14 +537,16 @@ def _service_tier_gate_patterns():
     """Return the original and API-key-enabled service-tier gate patterns."""
     identifier = r'[a-zA-Z_$][a-zA-Z0-9_$]*'
     original = re.compile(
-        rf'(?<![a-zA-Z0-9_$])({identifier})=(?:true\|\|)?({identifier})\?\.authMethod===`chatgpt`'
+        rf'(?<![a-zA-Z0-9_$])({identifier})=(?:true\|\|)?({identifier})\?\.authMethod==='
+        rf'(?:`apikey`\|\|\2\?\.authMethod===)?`chatgpt`'
         rf'(?P<personal_access>\|\|\2\?\.authMethod===`personalAccessToken`)?,'
         rf'({identifier})=\2\?\.authMethod\?\?null'
     )
     patched = re.compile(
         rf'(?<![a-zA-Z0-9_$])({identifier})=(?:true\|\|)?({identifier})\?\.authMethod===`apikey`\|\|'
         rf'\2\?\.authMethod===`chatgpt`'
-        rf'(?:\|\|\2\?\.authMethod===`personalAccessToken`)?,'
+        rf'(?:\|\|\2\?\.authMethod===`personalAccessToken`)?'
+        rf'\|\|\2\?\.authMethod==null&&\2\?\.requiresAuth===!1,'
         rf'({identifier})=\2\?\.authMethod\?\?null'
     )
     return original, patched
@@ -565,6 +567,7 @@ def _service_tier_gate_candidates(assets, require_semantic_marker=False):
             continue
         if (require_semantic_marker and
                 "isServiceTierAllowed" not in content and
+                "serviceTierAccess" not in content and
                 "canUseFastMode" not in content):
             continue
         if original.search(content) or patched.search(content):
@@ -578,6 +581,93 @@ def _service_tier_gate_candidates(assets, require_semantic_marker=False):
             else:
                 weak_candidates.append(fp)
     return candidates or weak_candidates
+
+
+def apply_custom_provider_fast_request_patch(fp):
+    """Recognize no-login providers only for service-tier request resolution."""
+    with open(fp, encoding="utf-8") as fh:
+        content = fh.read()
+    # Older standalone request chunks do not contain the account resolver.
+    if ".rpc.getAccount(" not in content:
+        return
+    identifier = r'[a-zA-Z_$][a-zA-Z0-9_$]*'
+    name = f"{os.path.basename(fp)}: Fast custom-provider request auth"
+    caller_pattern = re.compile(
+        rf'async function {identifier}\((?P<scope>{identifier}),'
+        rf'(?P<host>{identifier})\)\{{let (?P<method>{identifier})=await '
+        rf'(?P<resolver>{identifier})\((?P=scope),(?P=host)'
+        rf'(?P<enabled>,!0)?(?P<close>\));if\((?P=method)!==`chatgpt`'
+        rf'(?:&&(?P=method)!==`apikey`)?'
+        rf'(?:&&(?P=method)!==`personalAccessToken`)?\)return(?:!1| null);'
+    )
+    candidates = []
+    for caller in caller_pattern.finditer(content):
+        signature = re.search(
+            rf'async function {re.escape(caller.group("resolver"))}\('
+            rf'{identifier},{identifier}'
+            rf'(?:,(?P<allow>{identifier})=!1)?\)\{{', content,
+        )
+        if signature is None:
+            continue
+        end = _js_block_end(content, signature.end() - 1)
+        if end is not None and ".rpc.getAccount(" in content[signature.end():end]:
+            candidates.append((caller, signature, end))
+    if len(candidates) != 1:
+        mark_missing(name, "Ambiguous service-tier account resolver")
+        return
+    caller, signature, end = candidates[0]
+    body = content[signature.end():end]
+    original = re.compile(
+        rf'(?P<method>{identifier})===`personalAccessToken`\?(?P=method):'
+        rf'(?P<mapper>{identifier})\((?P<response>{identifier})\.account\)'
+    )
+    allow = signature.group("allow")
+    if allow is not None:
+        patched = re.compile(
+            rf'(?P<method>{identifier})===`personalAccessToken`\?(?P=method):'
+            rf'{re.escape(allow)}&&(?P<response>{identifier})\.account==null&&'
+            rf'(?P=response)\.requiresOpenaiAuth===!1\?`apikey`:'
+            rf'{identifier}\((?P=response)\.account\)'
+        )
+        if (caller.group("enabled") and len(list(patched.finditer(body))) == 1
+                and not original.search(body)):
+            mark_satisfied(fp, "Fast custom-provider request auth", "Already applied")
+            return
+        mark_missing(name, "Incomplete custom-provider request patch")
+        return
+    matches = list(original.finditer(body))
+    if len(matches) != 1 or caller.group("enabled"):
+        mark_missing(name, "Target structure mismatch")
+        return
+    match = matches[0]
+    allow = "__codexAllowCustomProvider"
+    used_identifiers = set(re.findall(identifier, body))
+    suffix = 2
+    while allow in used_identifiers:
+        allow = f"__codexAllowCustomProvider{suffix}"
+        suffix += 1
+    response = match.group("response")
+    replacement = (
+        f"{match.group('method')}===`personalAccessToken`?{match.group('method')}:"
+        f"{allow}&&{response}.account==null&&"
+        f"{response}.requiresOpenaiAuth===!1?`apikey`:"
+        f"{match.group('mapper')}({response}.account)"
+    )
+    # The resolver is shared by plugin queries. Its default stays unchanged;
+    # only the service-tier caller opts into the custom-provider branch.
+    call_end = caller.start("close")
+    edits = [
+        (signature.end() - 2, signature.end() - 2, f",{allow}=!1"),
+        (signature.end() + match.start(), signature.end() + match.end(), replacement),
+        (call_end, call_end, ",!0"),
+    ]
+    if not DRY_RUN:
+        for start, stop, replacement in sorted(edits, reverse=True):
+            content = content[:start] + replacement + content[stop:]
+        with open(fp, "w", encoding="utf-8") as fh:
+            fh.write(content)
+    results["applied"].append(name)
+    print("    [OK]   Fast custom-provider request auth")
 
 
 def _function_spans(content):
@@ -1631,6 +1721,7 @@ def step_patch_js(assets):
         # 26.915 moved the hook into app-initial-*.js while consumer chunks
         # retained the same result/auth markers. Match the complete gate so a
         # consumer chunk cannot be selected as the patch target.
+        # 26.1007 returns a serviceTierAccess map instead of a boolean flag.
         files = _service_tier_gate_candidates(
             assets, require_semantic_marker=True)
     fast_ui_fp = _single_patch_target(files, "Service tier authorization gate")
@@ -1663,7 +1754,9 @@ def step_patch_js(assets):
                 lambda m: (
                     f"{m.group(1)}={m.group(2)}?.authMethod===`apikey`||"
                     f"{m.group(2)}?.authMethod===`chatgpt`"
-                    f"{m.group('personal_access') or ''},"
+                    f"{m.group('personal_access') or ''}||"
+                    f"{m.group(2)}?.authMethod==null&&"
+                    f"{m.group(2)}?.requiresAuth===!1,"
                     f"{m.group(4)}={m.group(2)}?.authMethod??null"
                 ),
                 skip_regex=service_tier_patched.pattern)
@@ -1680,17 +1773,21 @@ def step_patch_js(assets):
     request_tier_fp = _single_patch_target(
         request_tier_files, "Fast request service tier gate", required=False)
     if request_tier_fp is not None:
+        # 26.1007 returns an access map or null instead of a boolean. Preserve
+        # the original rejection value when widening the authentication gate.
         apply_patch(request_tier_fp, "Fast request service tier gate",
             None, None,
             r'if\(([a-zA-Z_$][a-zA-Z0-9_$]*)!==`chatgpt`'
-            r'(?P<personal_access>&&\1!==`personalAccessToken`)?\)return!1;',
+            r'(?P<personal_access>&&\1!==`personalAccessToken`)?\)'
+            r'return(?P<denied>!1| null);',
             lambda m: (
                 f"if({m.group(1)}!==`chatgpt`&&{m.group(1)}!==`apikey`"
-                f"{m.group('personal_access') or ''})return!1;"
+                f"{m.group('personal_access') or ''})return{m.group('denied')};"
             ),
             skip_regex=(
                 r'if\(([a-zA-Z_$][a-zA-Z0-9_$]*)!==`chatgpt`&&\1!==`apikey`'
-                r'(?:&&\1!==`personalAccessToken`)?\)return!1;'))
+                r'(?:&&\1!==`personalAccessToken`)?\)return(?:!1| null);'))
+        apply_custom_provider_fast_request_patch(request_tier_fp)
 
     # -- Module 2: latest models and reasoning efforts (2 patches) ------
     # API key sessions do not receive the ChatGPT Statsig hidden-model

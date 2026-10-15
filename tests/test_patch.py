@@ -715,6 +715,176 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
             self.assertIn("[SKIP] Fast request service tier gate", second.stdout)
             self.assertEqual(patched, [target.read_bytes() for target in (ui, request)])
 
+    def test_261007_service_tier_access_map_and_null_request_gate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            assets = Path(tmp)
+            fixture = write_supported_assets(assets)
+            fixture["service_tier"].unlink()
+            fixture["request_tier"].unlink()
+            target = assets / "app-initial-261007-test.js"
+            target.write_text(
+                "function ui(method,access,pending=false,authLoading=false){"
+                "let auth={authMethod:method,isLoading:authLoading},"
+                "gate=auth?.authMethod===`chatgpt`||"
+                "auth?.authMethod===`personalAccessToken`,"
+                "authMethod=auth?.authMethod??null;"
+                "let loading=!!auth?.isLoading||gate&&pending;"
+                "return{serviceTierAccess:gate&&!loading&&access!=null?"
+                "access:null,isLoading:loading}}"
+                "async function request(method,access){let n=await method;"
+                "if(n!==`chatgpt`&&n!==`personalAccessToken`)return null;"
+                "return access}"
+                "async function read(method,access){try{"
+                "return await request(method,access)}catch(error){"
+                "console.error(`Failed to read service tier for request`,"
+                "error);return null}}"
+                "const methods=[`apikey`,`chatgpt`,`personalAccessToken`,"
+                "`copilot`,`amazonBedrock`,null],"
+                "access={fast:true,ultrafast:false},"
+                "restricted={fast:false,ultrafast:false};"
+                "console.log(JSON.stringify({"
+                "ui:methods.map(method=>ui(method,access).serviceTierAccess),"
+                "request:await Promise.all(methods.map(method=>"
+                "read(method,access))),"
+                "pending:ui(`apikey`,access,true),"
+                "authLoading:ui(`apikey`,access,false,true),"
+                "missing:ui(`apikey`,null).serviceTierAccess,"
+                "restricted:[ui(`apikey`,restricted).serviceTierAccess,"
+                "await read(`apikey`,restricted)]}))",
+                encoding="utf-8",
+            )
+            decoy = assets / "app-primary-consumer.js"
+            decoy_source = (
+                "function consumer(){let{serviceTierAccess:access}=useTier();"
+                "return{serviceTierAccess:access}}"
+            )
+            decoy.write_text(decoy_source, encoding="utf-8")
+
+            first = self.run_patch(assets)
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            self.assertIn("[OK]   Service tier authorization gate", first.stdout)
+            self.assertIn("[OK]   Fast request service tier gate", first.stdout)
+            self.assertEqual(decoy_source, decoy.read_text("utf-8"))
+            checked = subprocess.run(
+                ["node", str(target)], capture_output=True, text=True,
+                check=True, timeout=10,
+            )
+            access = {"fast": True, "ultrafast": False}
+            restricted = {"fast": False, "ultrafast": False}
+            self.assertEqual({
+                "ui": [access, access, access, None, None, None],
+                "request": [access, access, access, None, None, None],
+                "pending": {"serviceTierAccess": None, "isLoading": True},
+                "authLoading": {"serviceTierAccess": None, "isLoading": True},
+                "missing": None,
+                "restricted": [restricted, restricted],
+            }, json.loads(checked.stdout))
+
+            patched = target.read_bytes()
+            second = self.run_patch(assets)
+            self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+            self.assertIn("[SKIP] Service tier authorization gate", second.stdout)
+            self.assertIn("[SKIP] Fast request service tier gate", second.stdout)
+            self.assertEqual(patched, target.read_bytes())
+
+    def test_custom_provider_fast_ui_and_request_preserve_capabilities(self):
+        for previous_patch in (False, True):
+            with self.subTest(previous_patch=previous_patch), \
+                    tempfile.TemporaryDirectory() as tmp:
+                assets = Path(tmp)
+                fixture = write_supported_assets(assets)
+                fixture["service_tier"].unlink()
+                fixture["request_tier"].unlink()
+                target = assets / "app-initial-custom-fast.js"
+                source = (
+                    "function ui(auth,capability){let "
+                    "gate=auth?.authMethod===`chatgpt`||"
+                    "auth?.authMethod===`personalAccessToken`,"
+                    "method=auth?.authMethod??null;"
+                    "return{serviceTierAccess:gate&&!auth?.isLoading?"
+                    "capability:null}}"
+                    "function accountMethod(account){return account?.type??null}"
+                    "async function auth(e,t){"
+                    "const __codexAllowCustomProvider=0;"
+                    "if(e.method===`copilot`)return`copilot`;"
+                    "let[s,c]=await Promise.all([e.rpc.getAccount(t),"
+                    "e.rpc.getAuthMethod(t)]);"
+                    "return c===`personalAccessToken`?c:accountMethod(s.account)}"
+                    "async function access(e,t){let n=await auth(e,t);"
+                    "if(n!==`chatgpt`&&n!==`personalAccessToken`)return null;"
+                    "return await e.rpc.requirements(t)}"
+                    "async function read(e,t){try{return await access(e,t)}"
+                    "catch(error){console.error(`Failed to read service tier "
+                    "for request`,error);return null}}"
+                    "let rows=[];"
+                    "for(let method of [null,undefined,`apikey`,`chatgpt`,"
+                    "`personalAccessToken`,`copilot`,`amazonBedrock`,`unknown`])"
+                    "for(let requiresAuth of [false,true,undefined])"
+                    "for(let fast of [false,true])"
+                    "for(let supported of [false,true]){"
+                    "let capability={fast,ultrafast:false},"
+                    "scope={method,rpc:{"
+                    "getAccount:async()=>({account:method==null?null:"
+                    "{type:method},requiresOpenaiAuth:requiresAuth}),"
+                    "getAuthMethod:async()=>method,"
+                    "requirements:async()=>capability}},"
+                    "visible=ui({authMethod:method,requiresAuth},capability)"
+                    ".serviceTierAccess,request=await read(scope,`local`);"
+                    "rows.push({method:String(method),requiresAuth:"
+                    "String(requiresAuth),fast,supported,"
+                    "visible:visible?.fast===true&&supported,"
+                    "request:request?.fast===true&&supported,"
+                    "shared:await auth(scope,`local`)})}"
+                    "console.log(JSON.stringify({rows,"
+                    "loading:ui({authMethod:null,requiresAuth:false,"
+                    "isLoading:true},{fast:true}).serviceTierAccess,"
+                    "missing:ui(null,{fast:true}).serviceTierAccess}))"
+                )
+                if previous_patch:
+                    source = source.replace(
+                        "gate=auth?.authMethod===`chatgpt`",
+                        "gate=auth?.authMethod===`apikey`||"
+                        "auth?.authMethod===`chatgpt`",
+                    ).replace(
+                        "n!==`chatgpt`&&n!==`personalAccessToken`",
+                        "n!==`chatgpt`&&n!==`apikey`&&"
+                        "n!==`personalAccessToken`",
+                    )
+                target.write_text(source, encoding="utf-8")
+                dry_run = subprocess.run(
+                    [sys.executable, str(PATCH_SCRIPT), "--assets", str(assets),
+                     "--dry-run"], capture_output=True, text=True, timeout=10,
+                )
+                self.assertEqual(dry_run.returncode, 0, dry_run.stdout + dry_run.stderr)
+                self.assertEqual(source, target.read_text("utf-8"))
+                first = self.run_patch(assets)
+                self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+                checked = subprocess.run(
+                    ["node", str(target)], capture_output=True, text=True,
+                    check=True, timeout=10,
+                )
+                observed = json.loads(checked.stdout)
+                self.assertIsNone(observed["loading"])
+                self.assertIsNone(observed["missing"])
+                for row in observed["rows"]:
+                    with self.subTest(row=row):
+                        allowed = row["method"] in (
+                            "apikey", "chatgpt", "personalAccessToken"
+                        ) or (row["method"] in ("null", "undefined") and
+                              row["requiresAuth"] == "false")
+                        expected = allowed and row["fast"] and row["supported"]
+                        self.assertEqual(expected, row["visible"])
+                        self.assertEqual(expected, row["request"])
+                        self.assertEqual(
+                            None if row["method"] in ("null", "undefined")
+                            else row["method"], row["shared"],
+                        )
+                patched = target.read_bytes()
+                second = self.run_patch(assets)
+                self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+                self.assertIn("[SKIP] Fast custom-provider request auth", second.stdout)
+                self.assertEqual(patched, target.read_bytes())
+
     def test_large_generated_payloads_do_not_stall_semantic_patch_scans(self):
         with tempfile.TemporaryDirectory() as tmp:
             assets = Path(tmp)

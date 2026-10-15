@@ -6,7 +6,8 @@ description: |
   returned by app-server, expose reasoning effort levels declared by models
   but hidden by experiment configuration, and remove API key gates from
   Fast/Speed, Browser, and Computer Use.
-version: 4.4.0
+metadata:
+  version: 4.5.0
 ---
 
 # Patch ChatGPT Codex - Unlock API Key Mode Features
@@ -15,7 +16,7 @@ version: 4.4.0
 
 Remove desktop UI gates that still depend on ChatGPT sign-in context when using API key mode.
 
-Verified with Windows Store versions `26.707.3748.0` and `26.930.4958.0`, and macOS app version `26.707.31428` (Apple Silicon). The display name and main entry point have changed to ChatGPT, but package names and directories may still use Codex. The script reads the MSIX manifest or macOS `Info.plist` as appropriate and retains fallback support for the old name.
+Verified with Windows Store versions `26.707.3748.0`, `26.930.4958.0`, and `26.1007.9446.0`, and macOS app version `26.707.31428` (Apple Silicon). The display name and main entry point have changed to ChatGPT, but package names and directories may still use Codex. The script reads the MSIX manifest or macOS `Info.plist` as appropriate and retains fallback support for the old name.
 
 ### Unlocked Features
 
@@ -23,8 +24,8 @@ Verified with Windows Store versions `26.707.3748.0` and `26.930.4958.0`, and ma
 |---|---------|----------------------|--------------|
 | 1 | Latest model list | API key mode has no ChatGPT hidden-model allowlist | Show every model returned by app-server |
 | 2 | Hidden reasoning effort options | API key mode has no ChatGPT experiment context | Show every option the model declares in `supportedReasoningEfforts` |
-| 3 | Fast/Speed UI | Hidden when `authMethod !== 'chatgpt'` | Enable the service tier selector |
-| 4 | Fast request tier | Restricted to `chatgpt` again before sending a request | Add `apikey` to the allowlist |
+| 3 | Fast/Speed UI | Older gates require ChatGPT/PAT authentication | Accept API keys and null auth with `requiresAuth === false`; retain capability checks |
+| 4 | Fast request tier | Request construction checks authentication again | Accept API keys and no-login custom providers only for service-tier resolution |
 | 5 | Plugins | Older versions restrict non-ChatGPT sessions; newer versions support API key mode natively | Patch older versions; skip automatically on newer versions |
 | 6 | Browser / Chrome | API key mode has no Statsig user context | Enable the desktop gate while retaining platform and app-server capability checks |
 | 7 | Computer Use | Availability and the Node runtime are restricted by Statsig gates | Enable both gates while retaining native service authentication and TCC checks |
@@ -180,22 +181,29 @@ For a custom provider with `requires_openai_auth = false`, `account/read` can re
 
 ### 3. Fast UI / Service Tier Gate
 
+Locate the complete authorization assignment and its adjacent authentication-method assignment. Older chunks return `isServiceTierAllowed`; `26.1007` returns a `serviceTierAccess` map in `app-initial-*.js`. Consumer chunks also reference these fields, so require the complete gate expression and a unique target before editing.
+
 ```bash
-grep -rl "isServiceTierAllowed" *.js
-# In use-service-tier-settings-*.js:
-# allowed=auth?.authMethod===`chatgpt`,method=auth?.authMethod??null
-# Change allowed to:
-# auth?.authMethod===`apikey`||auth?.authMethod===`chatgpt`
+rg -l 'isServiceTierAllowed|serviceTierAccess|canUseFastMode' -g '*.js'
 ```
+
+Extend the existing ChatGPT/PAT condition with `auth?.authMethod === 'apikey'` and `(auth?.authMethod == null && auth?.requiresAuth === false)`. A provider with `requires_openai_auth = false` can return `account: null`, so checking only `apikey` still hides Fast. Retain the hook's loading and capability checks, and recognize earlier API-key-only patches as inputs that need this upgrade.
+
+The model's `serviceTiers` supplies the available speed options. `configRequirements/read` supplies server restrictions such as `featureRequirements.fast_mode` and `ultrafast_mode`. Preserve both: enabling authentication must not invent a Fast tier or override an explicit server denial.
 
 ### 4. Fast Request Gate
 
+Find the service-tier request function and preserve its original rejection value. Older builds return `false`; `26.1007` returns `null` before resolving the access map. Add `apikey` to the existing ChatGPT/PAT allowlist without changing that return type.
+
 ```bash
-grep -rl "Failed to read service tier for request" *.js
-# In read-service-tier-for-request-*.js:
-# if(method!==`chatgpt`)return!1
-# Change to: if(method!==`chatgpt`&&method!==`apikey`)return!1
+rg -l 'Failed to read service tier for request' -g '*.js'
 ```
+
+In the `26.1007` merged chunk, the request helper shares its async account resolver with plugin queries. Add a parameter that defaults to `false`, and enable it only at the service-tier call site. With that parameter enabled, map `account == null && requiresOpenaiAuth === false` to the local `apikey` branch; preserve the resolver's default behavior for plugin queries, ChatGPT, PAT, Copilot, Bedrock, and unauthenticated sessions that still require OpenAI login.
+
+Validate the UI and request paths together. Cover null and undefined auth, explicit `requiresAuth` values, loading state, models with and without Fast, server denial, migration from earlier patches, and repeated execution. Windows `26.1007.9446.0` passed 36 tests and 467 subtests on 2026-10-15; the full rebuild applied 12 patches with no failures, and extracted real functions returned Fast access for local no-login provider data while still rejecting a simulated server denial.
+
+After an assets-only check, run the complete workflow to repack `app.asar` and update the embedded Windows hash, then relaunch the patched shortcut. Verify the packed code and matching integrity hash before reporting success. Function-level checks and a responsive renderer establish compatibility and startup; they do not establish model response speed or a completed billable Fast request.
 
 ### 5. Plugins
 
