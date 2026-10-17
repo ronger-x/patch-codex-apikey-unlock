@@ -7,7 +7,7 @@ description: |
   but hidden by experiment configuration, and remove API key gates from
   Fast/Speed, Browser, and Computer Use.
 metadata:
-  version: 4.5.0
+  version: 4.6.0
 ---
 
 # Patch ChatGPT Codex - Unlock API Key Mode Features
@@ -16,7 +16,7 @@ metadata:
 
 Remove desktop UI gates that still depend on ChatGPT sign-in context when using API key mode.
 
-Verified with Windows Store versions `26.707.3748.0`, `26.930.4958.0`, and `26.1007.9446.0`, and macOS app version `26.707.31428` (Apple Silicon). The display name and main entry point have changed to ChatGPT, but package names and directories may still use Codex. The script reads the MSIX manifest or macOS `Info.plist` as appropriate and retains fallback support for the old name.
+Verified with Windows Store versions `26.707.3748.0`, `26.930.4958.0`, and `26.1007.9446.0`, and macOS app versions `26.707.31428` and `26.1013.31256` (Apple Silicon). The display name and main entry point have changed to ChatGPT, but package names and directories may still use Codex. The script reads the MSIX manifest or macOS `Info.plist` as appropriate and retains fallback support for the old name.
 
 ### Unlocked Features
 
@@ -55,7 +55,7 @@ python3 patch.py --dry-run
 
 ## macOS
 
-The script checks `/Applications` and `~/Applications` in order for `ChatGPT.app` / `Codex.app`, reads the actual executable from `Info.plist`, and requires a Codex runtime marker in Resources. The official app is never modified. The patched copy is written beside it, with fallback to `~/Applications` if that directory is not writable. The copy is named `ChatGPT-Codex-Patched.app` for the new brand and `Codex-Patched.app` for the old brand.
+The script checks `/Applications` and `~/Applications` in order for `ChatGPT.app` / `Codex.app`, reads the actual executable from `Info.plist`, and requires a Codex runtime marker in Resources (the `codex`/`codex.exe` file, or `com.openai.codex.manifest`, a file in earlier builds and a directory from 26.1013). The official app is never modified. The patched copy is written beside it, with fallback to `~/Applications` if that directory is not writable. The copy is named `ChatGPT-Codex-Patched.app` for the new brand and `Codex-Patched.app` for the old brand.
 
 ### One-Command Patch
 
@@ -67,7 +67,7 @@ python3 patch.py --app /path/to/Codex.app \
   --output "$HOME/Applications/ChatGPT-Codex-Patched.app"
 ```
 
-On completion, the script refreshes the `ElectronAsarIntegrity` header hash in `Info.plist`, applies an ad-hoc signature only to the outermost app, and strictly verifies the entire bundle. Signing removes application-group/keychain entitlements that are valid only for the OpenAI Team ID while preserving runtime permissions for JIT, audio, camera, networking, automation, and similar features. Internally bundled frameworks/helpers carrying OpenAI signatures are not rewritten. To load these components with different signatures, the outer entitlement disables library validation. This weakens dynamic-library injection protection for the outer process, so this treatment is used only for the independent copy.
+On completion, the script refreshes the `ElectronAsarIntegrity` header hash in `Info.plist`, applies an ad-hoc signature only to the outermost app, and strictly verifies the entire bundle. Signing removes application-group/keychain entitlements that are valid only for the OpenAI Team ID while preserving runtime permissions for JIT, audio, camera, networking, automation, and similar features. From 26.1013 the runtime framework embeds a digest of the whole `ElectronAsarIntegrity` dictionary (`__asar_integrity` section in `Codex Framework`); a stale digest kills start-up with `Failed to get integrity for validatable asar archive`. The workflow recomputes the digest over the updated plist entries (SHA-256 of sorted key + algorithm + hash), rewrites the 40+ byte slot behind the `AGbevlPCksUGKNL8TSn7wGmJEuJsXb2A` sentinel when the packaged digest is `used`/version 1, and ad-hoc re-signs that framework together with its Electron helpers. The helpers enforce library validation when they `dlopen` the re-signed framework, so each helper (the `.app` bundles under the framework plus `app_mode_loader` and `web_app_shortcut_copier`) is re-signed with its original entitlements minus OpenAI Team-ID application groups plus `disable-library-validation`. Nested code deeper than one level and unrelated frameworks such as Sparkle keep their OpenAI signatures; the outer entitlement also disables library validation so these different signatures load. This weakens dynamic-library injection protection for the outer process and its helpers, so this treatment is used only for the independent copy.
 
 ### Browser and Computer Use
 
@@ -245,6 +245,8 @@ grep -rl 'computerUseNodeRepl' *.js
 # The computerUseNodeRepl field synchronized to the main process has a separate runtime gate.
 # The script ORs the original gate with API key mode without bypassing computer.available.
 # Other authentication modes continue to use the original gate.
+# 26.1013 removed this field; the patched availability gate already covers
+# the whole frontend computer-use path, so the runtime patch reports absent.
 ```
 
 During runtime verification, the marketplace should contain `computer-use`, and the OpenAI-signed `SkyComputerUseService` should create the group-container socket. The TCC entry is named `Codex Computer Use`. Do not bypass service authentication by modifying native binaries or using `codesign --deep`.
@@ -283,6 +285,7 @@ grep -rn "enable_i18n" *.js
 | Update the Windows embedded ASAR hash | Electron validates the repacked archive before starting the renderer | Copied `ChatGPT.exe` (Windows only) |
 | Preserve `.node` / native module sidecars | Electron must load native extensions from disk | `app.asar.unpacked` |
 | Update `ElectronAsarIntegrity` | Match the repacked ASAR header hash to `Info.plist` | `Info.plist` (macOS only) |
+| Refresh the framework digest slot | Starting with 26.1013, Electron compares a packaged digest of the whole integrity dictionary and dies on mismatch | `Codex Framework` binary (macOS only, 26.1013+) |
 | Apply an outer ad-hoc signature and strict verification | Allow the modified copy to launch while preserving internal OpenAI signatures | Final step (macOS only) |
 | Bypass hidden-model filtering | API key mode has no ChatGPT Statsig model allowlist | `model-list-filter-*` |
 | Bypass reasoning-effort filtering | API key mode has no ChatGPT experiment context, so the enabled set may hide model-declared options | `model-list-filter-*` |

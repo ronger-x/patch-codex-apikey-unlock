@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import plistlib
 import runpy
 import shutil
@@ -1311,6 +1312,7 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
                 mock.patch.object(
                     patch_module.os.path, "expanduser", return_value=tmp
                 ),
+                mock.patch.dict("os.environ", {"LOCALAPPDATA": tmp}),
                 mock.patch.object(patch_module, "run_cmd") as run_cmd,
                 contextlib.redirect_stdout(io.StringIO()),
             ):
@@ -1744,6 +1746,41 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
                 ),
             )
 
+    def test_macos_detects_26_1013_manifest_marker(self):
+        # 26.1013 removed the plain `codex` file; the Codex manifest stays
+        # behind as a marker directory named com.openai.codex.manifest.
+        with (
+            loaded_patch_module() as patch_module,
+            tempfile.TemporaryDirectory() as tmp,
+        ):
+            app = Path(tmp) / "ChatGPT.app"
+            executable = app / "Contents" / "MacOS" / "ChatGPT"
+            resources = app / "Contents" / "Resources"
+            executable.parent.mkdir(parents=True)
+            (resources / "com.openai.codex.manifest" / "Contents").mkdir(
+                parents=True,
+            )
+            executable.touch()
+            (resources / "app.asar").touch()
+            with (app / "Contents" / "Info.plist").open("wb") as fh:
+                plistlib.dump({"CFBundleExecutable": "ChatGPT"}, fh)
+
+            self.assertTrue(patch_module._is_codex_resources(str(resources)))
+            legacy = Path(tmp) / "Legacy.app" / "Contents" / "Resources"
+            legacy.mkdir(parents=True)
+            self.assertFalse(patch_module._is_codex_resources(str(legacy)))
+
+            patch_module.IS_MACOS = True
+            patch_module.IS_WINDOWS = False
+            patch_module.MACOS_APP_PATHS = (str(app),)
+            with contextlib.redirect_stdout(io.StringIO()):
+                detected = patch_module.step_detect()
+
+            self.assertEqual(
+                detected,
+                (str(app), str(resources), str(executable), False),
+            )
+
     def test_macos_executable_falls_back_to_legacy_codex_name(self):
         with (
             loaded_patch_module() as patch_module,
@@ -1830,6 +1867,173 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
                 updated["ElectronAsarIntegrity"]["Resources/app.asar"]["hash"],
                 expected,
             )
+
+    def test_macos_integrity_dictionary_digest_matches_electron_algorithm(self):
+        with loaded_patch_module() as patch_module:
+            # integrity_digest.mm hashes sorted keys with key, algorithm, hash
+            # concatenated and no separators.
+            hasher = hashlib.sha256()
+            hasher.update(b"Resources/app.asar")
+            hasher.update(b"SHA256")
+            hasher.update(b"81f264f153315b30b03dbdbd69fe507e4dbc0d39cfa2741a83b7fc7ab6afe5c8")
+            self.assertEqual(
+                patch_module._integrity_dictionary_digest({
+                    "Resources/app.asar": {
+                        "algorithm": "SHA256",
+                        "hash": "81f264f153315b30b03dbdbd69fe507e4dbc0d39cfa2741a83b7fc7ab6afe5c8",
+                    },
+                }),
+                hasher.hexdigest(),
+            )
+
+    def _write_integrity_fixture(self, patch_module, tmp, slot):
+        """Create a copy bundle with one asar and one framework digest slot."""
+        header = b'{"files":{"index.js":{"size":1,"offset":"0"}}}'
+        string_pickle = struct.pack("<II", len(header) + 1, len(header))
+        string_pickle += header + b"\0"
+        string_pickle += b"\0" * (-len(string_pickle) % 4)
+        size_pickle = struct.pack("<II", 4, len(string_pickle))
+        app = tmp / "Patched.app"
+        resources = app / "Contents" / "Resources"
+        resources.mkdir(parents=True)
+        asar = resources / "app.asar"
+        asar.write_bytes(size_pickle + string_pickle + b"x")
+        with (app / "Contents" / "Info.plist").open("wb") as fh:
+            plistlib.dump(
+                {
+                    "ElectronAsarIntegrity": {
+                        "Resources/app.asar": {
+                            "algorithm": "SHA256",
+                            "hash": "stale",
+                        }
+                    }
+                },
+                fh,
+                fmt=plistlib.FMT_BINARY,
+            )
+        framework = app / "Contents" / "Frameworks" / "X Framework.framework"
+        framework.mkdir(parents=True)
+        binary = framework / "X Framework"
+        binary.write_bytes(b"filler\0" + slot + b"tail\0")
+        return app, asar, framework, binary
+
+    def test_macos_integrity_digest_mirrors_into_framework_slot(self):
+        with (
+            loaded_patch_module() as patch_module,
+            tempfile.TemporaryDirectory() as tmp,
+        ):
+            original_entries = {
+                "Resources/app.asar": {
+                    "algorithm": "SHA256",
+                    "hash": "original-hash",
+                },
+            }
+            slot = (
+                patch_module._INTEGRITY_DIGEST_SENTINEL
+                + bytes([1, 1])
+                + bytes.fromhex(
+                    patch_module._integrity_dictionary_digest(original_entries),
+                )
+            )
+            app, asar, framework, binary = self._write_integrity_fixture(
+                patch_module, Path(tmp), slot,
+            )
+
+            self.assertEqual(
+                patch_module._framework_digest_targets(str(app)),
+                [(str(framework), os.path.realpath(str(binary)),
+                  len(b"filler\0"), "X Framework.framework")],
+            )
+
+            patch_module.DRY_RUN = False
+            with contextlib.redirect_stdout(io.StringIO()):
+                patch_module.step_update_macos_asar_integrity(str(app))
+
+            expected_hash = patch_module._asar_header_hash(str(asar))
+            with (app / "Contents" / "Info.plist").open("rb") as fh:
+                info = plistlib.load(fh)
+            self.assertEqual(
+                info["ElectronAsarIntegrity"]["Resources/app.asar"]["hash"],
+                expected_hash,
+            )
+
+            expected_digest = patch_module._integrity_dictionary_digest({
+                "Resources/app.asar": {
+                    "algorithm": "SHA256",
+                    "hash": expected_hash,
+                },
+            })
+            with binary.open("rb") as fh:
+                image = fh.read()
+            offset = image.find(patch_module._INTEGRITY_DIGEST_SENTINEL) + len(
+                patch_module._INTEGRITY_DIGEST_SENTINEL,
+            )
+            self.assertEqual(
+                image[offset:offset + 2 + 32],
+                bytes([1, 1]) + bytes.fromhex(expected_digest),
+            )
+            self.assertIn(str(framework),
+                          patch_module._modified_framework_bundles)
+            self.assertEqual([], patch_module._modified_helper_bundles)
+
+            # A second run sees the mirrored digest and writes nothing.
+            patch_module._modified_framework_bundles.clear()
+            before = binary.read_bytes()
+            with contextlib.redirect_stdout(io.StringIO()):
+                patch_module.step_update_macos_asar_integrity(str(app))
+            self.assertFalse(patch_module._modified_framework_bundles)
+            self.assertEqual(binary.read_bytes(), before)
+
+    def test_macos_integrity_digest_ignores_inactive_slot(self):
+        with (
+            loaded_patch_module() as patch_module,
+            tempfile.TemporaryDirectory() as tmp,
+        ):
+            slot = (
+                patch_module._INTEGRITY_DIGEST_SENTINEL
+                + bytes([0, 1])
+                + bytes.fromhex(
+                    patch_module._integrity_dictionary_digest({
+                        "Resources/app.asar": {
+                            "algorithm": "SHA256",
+                            "hash": "other",
+                        },
+                    }),
+                )
+                + bytes(32)
+            )
+            app, asar, framework, binary = self._write_integrity_fixture(
+                patch_module, Path(tmp), slot,
+            )
+            patch_module.DRY_RUN = False
+            with contextlib.redirect_stdout(io.StringIO()):
+                patch_module.step_update_macos_asar_integrity(str(app))
+            self.assertFalse(patch_module._modified_framework_bundles)
+            self.assertEqual(binary.read_bytes()[len(b"filler\0"):-len(b"tail\0")],
+                             slot)
+
+    def test_macos_integrity_helpers_are_enumerated_from_rewritten_framework(self):
+        with loaded_patch_module() as patch_module:
+            with tempfile.TemporaryDirectory() as tmp:
+                bundle = Path(tmp) / "X Framework.framework"
+                helpers_dir = bundle / "Versions" / "155.0" / "Helpers"
+                renderer = helpers_dir / "Codex (Renderer).app"
+                renderer.mkdir(parents=True)
+                # Versions/Current points at the same directory; the helper
+                # list must contain each path exactly once.
+                os.symlink(renderer, helpers_dir / "softlink.app")
+                (helpers_dir / "app_mode_loader").touch()
+                (helpers_dir / "web_app_shortcut_copier").touch()
+                (helpers_dir / "browser_crashpad_handler").touch()
+
+                self.assertEqual(
+                    patch_module._helper_bundles_for(str(bundle)),
+                    [
+                        str(renderer),
+                        str(helpers_dir / "app_mode_loader"),
+                        str(helpers_dir / "web_app_shortcut_copier"),
+                    ],
+                )
 
     def test_macos_signing_failure_stops_the_run(self):
         with loaded_patch_module() as patch_module:

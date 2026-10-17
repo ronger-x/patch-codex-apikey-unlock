@@ -2,7 +2,7 @@
 
 This project targets the Codex desktop app whose display name has been changed to **ChatGPT**. It unlocks the model list, reasoning effort levels, service tiers, and other features in API key mode.
 
-It has been verified with Windows Store versions `26.707.3748.0`, `26.930.4958.0`, and `26.1007.9446.0`, and the macOS app versions `26.707.31428` and `26.721.31836` (Apple Silicon). In these versions, the display name and primary entry point have changed to ChatGPT, while installation packages may still use the Codex name. The script supports both the old and new names.
+It has been verified with Windows Store versions `26.707.3748.0`, `26.930.4958.0`, and `26.1007.9446.0`, and the macOS app versions `26.707.31428` and `26.1013.31256` (Apple Silicon). In these versions, the display name and primary entry point have changed to ChatGPT, while installation packages may still use the Codex name. The script supports both the old and new names.
 
 ## Unlocked Features
 
@@ -51,7 +51,7 @@ python3 patch.py
 
 ### macOS Paths
 
-By default, the script searches `/Applications` and `~/Applications`, in that order, for `ChatGPT.app` or `Codex.app`. It places the patched copy next to the official app when possible. If that directory is not writable, it automatically uses `~/Applications`.
+By default, the script searches `/Applications` and `~/Applications`, in that order, for `ChatGPT.app` or `Codex.app`. It places the patched copy next to the official app when possible. If that directory is not writable, it automatically uses `~/Applications`. Detection looks for a Codex runtime marker in `Contents/Resources`: the plain `codex`/`codex.exe` file, or `com.openai.codex.manifest` (a file in macOS 26.915 and earlier, a directory from 26.1013).
 
 You can also specify the paths explicitly:
 
@@ -61,7 +61,7 @@ python3 patch.py \
   --output "$HOME/Applications/ChatGPT-Codex-Patched.app"
 ```
 
-The script does not modify the official app. On macOS, it updates the ASAR integrity metadata in the copy, removes the quarantine attribute, and applies an ad-hoc signature. The officially signed runtime frameworks and helpers remain unchanged. To allow the ad-hoc signed outer app to load those internal components, library validation is disabled for the outer signature. This weakens protection against dynamic-library injection, so this treatment is used only for the separate copy.
+The script does not modify the official app. On macOS, it updates the ASAR integrity metadata in the copy, removes the quarantine attribute, and applies an ad-hoc signature. When the build embeds Electron's integrity-dictionary digest in the runtime framework (26.1013 and later), the copy's framework is updated with the recomputed digest and re-signed ad-hoc together with its Electron helpers; unrelated frameworks and deeper nested code keep their OpenAI signatures. To allow the ad-hoc signed outer app to load those internal components, library validation is disabled for the outer signature. This weakens protection against dynamic-library injection, so this treatment is used only for the separate copy.
 
 ### macOS Browser and Computer Use
 

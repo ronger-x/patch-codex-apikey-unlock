@@ -58,6 +58,12 @@ MACOS_EXE_NAMES = ("ChatGPT", "Codex")
 ASAR_PACKAGE = "@electron/asar@3.4.1"
 FUSES_PACKAGE = "@electron/fuses@1.8.0"
 
+# Newer Electron embeds a digest of the Info.plist ElectronAsarIntegrity
+# dictionary inside the runtime framework (shell/common/asar/integrity_digest.mm).
+_INTEGRITY_DIGEST_SENTINEL = b"AGbevlPCksUGKNL8TSn7wGmJEuJsXb2A"
+_modified_framework_bundles = []
+_modified_helper_bundles = []
+
 if DRY_RUN:
     print("[DRY-RUN] Preview mode; no files will be modified.\n")
 
@@ -117,8 +123,11 @@ def _macos_executable(app_root):
 def _is_codex_resources(resources_dir):
     if not os.path.isfile(os.path.join(resources_dir, "app.asar")):
         return False
-    return any(os.path.isfile(os.path.join(resources_dir, marker))
-               for marker in ("codex", "codex.exe"))
+    # 26.1013 dropped the plain `codex` file; `com.openai.codex.manifest` is a
+    # file in earlier builds and a directory from 26.1013, so use exists().
+    return any(os.path.exists(os.path.join(resources_dir, marker))
+               for marker in ("codex", "codex.exe",
+                              "com.openai.codex.manifest"))
 
 
 def _store_app_details(store_root):
@@ -1943,6 +1952,10 @@ def step_patch_js(assets):
     )
     if node_runtime_fp is not None:
         apply_computer_use_node_repl_gate_patch(node_runtime_fp)
+    elif not node_runtime_feature_present:
+        # 26.1013 removed the computerUseNodeRepl runtime selector from the
+        # webview; the availability gate above is the whole frontend gate.
+        print("    [SKIP] Computer Use Node runtime (not present in 26.1013+)")
 
     # The outer macOS patched app has an ad-hoc signature. The Browser native
     # addon can return missing-code-signing-identity through the responsible
@@ -2281,6 +2294,32 @@ def step_update_windows_asar_integrity(exe_path, resources_dir):
     print(f"    Embedded ASAR hash updated ({occurrences} occurrence(s)).")
     print("    Note: the copied executable's vendor signature is no longer valid; the official app is unchanged.")
 
+    # Electron now also embeds a digest of the whole integrity dictionary in
+    # the runtime framework (macOS) at package time. 26.1007 on Windows keeps
+    # this out of the executable; die on an enabled slot rather than shipping
+    # a copy that cannot start.
+    _die_if_windows_integrity_digest_embedded(exe_path)
+
+
+def _die_if_windows_integrity_digest_embedded(exe_path):
+    sentinel = _INTEGRITY_DIGEST_SENTINEL
+    try:
+        with open(exe_path, "rb") as fh:
+            image = fh.read()
+    except OSError as exc:
+        _die(f"Unable to scan executable for integrity digest: {exc}")
+    if image.count(sentinel) != 1:
+        return
+    offset = image.find(sentinel) + len(sentinel)
+    if offset + 2 > len(image):
+        return
+    if image[offset] == 1 and image[offset + 1] == 1:
+        _die(
+            "The Windows executable embeds an active Electron integrity "
+            "dictionary digest, which this script cannot refresh. Report the "
+            "app version so the workflow can be adapted."
+        )
+
 
 def _windows_patched_user_data_dir():
     return os.path.join(
@@ -2332,6 +2371,130 @@ def step_update_macos_asar_integrity(app_path):
         _die(f"Unable to update Info.plist: {exc}")
     print("    ElectronAsarIntegrity updated.")
 
+    entries = {key: dict(value) for key, value in integrity.items()}
+    _update_framework_integrity_digest(app_path, entries)
+
+
+def _integrity_dictionary_digest(entries):
+    """Reproduce Electron integrity_digest.mm's dictionary digest.
+
+    The digest is SHA-256 over every entry of the ElectronAsarIntegrity
+    dictionary, keys sorted in byte order, covering key, algorithm, and hash
+    without separators.
+    """
+    hasher = hashlib.sha256()
+    for relative_path in sorted(entries):
+        entry = entries[relative_path]
+        hasher.update(relative_path.encode("utf-8"))
+        hasher.update(str(entry.get("algorithm", "")).encode("utf-8"))
+        hasher.update(str(entry.get("hash", "")).encode("utf-8"))
+    return hasher.hexdigest()
+
+
+def _framework_digest_targets(app_path):
+    """Return (bundle, binary, sentinel_offset, label) inside the copied bundle.
+
+    Only the runtime framework implements the digest slot; helpers and
+    libraries keep the sentinel absent, so scanning the main bundles is enough.
+    """
+    frameworks_dir = os.path.join(app_path, "Contents", "Frameworks")
+    if not os.path.isdir(frameworks_dir):
+        return []
+    targets = []
+    for bundle in sorted(glob.glob(os.path.join(frameworks_dir, "*.framework"))):
+        binary = os.path.join(
+            bundle, os.path.basename(bundle[:-len(".framework")]))
+        try:
+            real_binary = os.path.realpath(binary)
+            with open(real_binary, "rb") as fh:
+                image = fh.read()
+        except (OSError, ValueError):
+            continue
+        if image.count(_INTEGRITY_DIGEST_SENTINEL) == 1:
+            targets.append((
+                bundle, real_binary, image.find(_INTEGRITY_DIGEST_SENTINEL),
+                os.path.basename(bundle),
+            ))
+    return targets
+
+
+def _update_framework_integrity_digest(app_path, entries):
+    """Mirror the updated plist dictionary digest into the framework binary.
+
+    When the packaged digest is active (used=1, version=1), Electron recomputes
+    the digest from the plist at every launch and dies on mismatch before
+    reading the archive, even when the per-entry hash itself is correct.
+    """
+    expected = bytes.fromhex(_integrity_dictionary_digest(entries))
+    for bundle, binary, offset, label in _framework_digest_targets(app_path):
+        slot_offset = offset + len(_INTEGRITY_DIGEST_SENTINEL)
+        try:
+            with open(binary, "r+b") as fh:
+                fh.seek(slot_offset)
+                slot = fh.read(2 + len(expected))
+        except OSError as exc:
+            _die(f"Unable to read integrity digest slot in {binary}: {exc}")
+        if len(slot) != 2 + len(expected):
+            _die(f"Integrity digest slot is truncated in {binary}")
+        used, version = slot[0], slot[1]
+        if used == 0:
+            # The digest is inactive; Electron fails open and accepts any
+            # plist contents, so no mirror is needed.
+            continue
+        if version != 1:
+            _die(f"Unsupported integrity digest version {version} in {binary}")
+        if slot[2:] == expected:
+            continue
+        try:
+            with open(binary, "r+b") as fh:
+                fh.seek(slot_offset)
+                fh.write(bytes([used, version]) + expected)
+                fh.flush()
+                fh.seek(slot_offset)
+                verified = fh.read(2 + len(expected))
+        except OSError as exc:
+            _die(f"Unable to write integrity digest slot in {binary}: {exc}")
+        if verified != bytes([used, version]) + expected:
+            _die(f"Integrity digest slot verification failed in {binary}")
+        # The rewrite invalidates OpenAI's framework signature; record the
+        # bundle for the ad-hoc refresh in step_finish_macos.
+        if bundle not in _modified_framework_bundles:
+            _modified_framework_bundles.append(bundle)
+        for helper in _helper_bundles_for(bundle):
+            if helper not in _modified_helper_bundles:
+                _modified_helper_bundles.append(helper)
+        print(f"    Integrity dictionary digest updated in {label}.")
+
+
+def _helper_bundles_for(framework_bundle):
+    """Return helper code that dlopen()s a rewritten framework.
+
+    Electron helpers keep OpenAI's strict library validation, so after the
+    framework is re-signed each helper must be refreshed with an entitlement
+    that disables it. Plain helper executables that also load the framework
+    are included except the standalone crashpad handlers.
+    """
+    helpers = []
+    for version_dir in sorted(glob.glob(
+            os.path.join(framework_bundle, "Versions", "*"))):
+        # Versions/Current links to a real version directory; skip links so
+        # each helper is recorded exactly once.
+        if os.path.islink(version_dir):
+            continue
+        helpers_dir = os.path.join(version_dir, "Helpers")
+        if not os.path.isdir(helpers_dir):
+            continue
+        for bundle in sorted(glob.glob(os.path.join(helpers_dir, "*.app"))):
+            # Only real .app directories are helper bundles.
+            if os.path.islink(bundle) or not os.path.isdir(bundle):
+                continue
+            helpers.append(bundle)
+        for plain in ("app_mode_loader", "web_app_shortcut_copier"):
+            helper = os.path.join(helpers_dir, plain)
+            if os.path.isfile(helper):
+                helpers.append(helper)
+    return helpers
+
 
 def _sanitize_macos_entitlements(entitlements):
     sanitized = {
@@ -2376,6 +2539,75 @@ def _macos_adhoc_entitlements(app_path):
 # ================================================================
 # Step 7: platform-specific finalization
 # ================================================================
+def _macos_optional_entitlements(path):
+    """Return a sanitized entitlements plist file for `path`, or None.
+
+    Helper executables may lack entitlements; a missing set is signed without
+    one. Found sets are sanitized to drop OpenAI Team-ID application groups and
+    gain disable-library-validation so the ad-hoc refresh stays loadable.
+    """
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                mode="wb", suffix=".plist", delete=False) as fh:
+            temp_path = fh.name
+        rc, _ = run_cmd(
+            ["codesign", "-d", "--xml", "--entitlements", temp_path, path],
+            capture=True)
+        if rc != 0:
+            os.unlink(temp_path)
+            return None
+        with open(temp_path, "rb") as fh:
+            entitlements = plistlib.load(fh)
+        if not isinstance(entitlements, dict):
+            os.unlink(temp_path)
+            return None
+        entitlements = _sanitize_macos_entitlements(entitlements)
+        with open(temp_path, "wb") as fh:
+            plistlib.dump(entitlements, fh, sort_keys=False)
+        return temp_path
+    except (OSError, plistlib.InvalidFileException):
+        if temp_path and os.path.exists(temp_path):
+            os.unlink(temp_path)
+        return None
+
+
+def _resign_integrity_bundles():
+    """Ad-hoc refresh for the rewritten framework and its Electron helpers.
+
+    Mirroring the digest slot invalidates OpenAI's framework signature, and
+    helpers enforce library validation when they `dlopen` the framework, so
+    each helper in the rewritten framework gains disable-library-validation
+    and is refreshed together with the framework. Nested code deeper than one
+    level keeps its OpenAI signature.
+    """
+    tasks = [
+        (helper, "helper")
+        for helper in list(dict.fromkeys(_modified_helper_bundles))
+    ]
+    _modified_helper_bundles.clear()
+    tasks += [
+        (bundle, "framework")
+        for bundle in list(dict.fromkeys(_modified_framework_bundles))
+    ]
+    _modified_framework_bundles.clear()
+    for bundle, kind in tasks:
+        entitlements_path = _macos_optional_entitlements(bundle)
+        try:
+            command = ["codesign", "--force", "--sign", "-",
+                       "--preserve-metadata=identifier,flags,runtime"]
+            if entitlements_path is not None:
+                command += ["--entitlements", entitlements_path]
+            command += [bundle]
+            rc, output = run_cmd(command, capture=True)
+        finally:
+            if entitlements_path and os.path.exists(entitlements_path):
+                os.unlink(entitlements_path)
+        if rc != 0:
+            _die(f"macOS {kind} re-signing failed for {bundle}: {output}")
+        print(f"    Re-signed modified {kind}: {os.path.basename(bundle)}")
+
+
 def step_finish_macos(app_path):
     print("[7] Signing and verifying the macOS copy...")
     if DRY_RUN:
@@ -2386,6 +2618,8 @@ def step_finish_macos(app_path):
         ["xattr", "-dr", "com.apple.quarantine", app_path], capture=True)
     if rc != 0:
         _die(f"Unable to remove quarantine from the patched copy: {output}")
+
+    _resign_integrity_bundles()
 
     entitlements_path = _macos_adhoc_entitlements(app_path)
     try:
@@ -2496,8 +2730,9 @@ else:
     step_repack_asar(resources_dir)
 
     if IS_MACOS:
-        # Preserve Owl/Electron ASAR integrity metadata without modifying the
-        # large runtime framework.
+        # Preserve Owl/Electron ASAR integrity metadata. On builds that embed
+        # the integrity-dictionary digest (26.1013+), the copied framework is
+        # also updated and ad-hoc re-signed. The official app is untouched.
         step_update_macos_asar_integrity(work_root)
         step_finish_macos(work_root)
     else:
