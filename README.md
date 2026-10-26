@@ -2,7 +2,7 @@
 
 This project targets the Codex desktop app whose display name has been changed to **ChatGPT**. It unlocks the model list, reasoning effort levels, service tiers, and other features in API key mode.
 
-It has been verified with Windows Store versions `26.707.3748.0`, `26.930.4958.0`, and `26.1007.9446.0`, and the macOS app versions `26.707.31428` and `26.1013.31256` (Apple Silicon). In these versions, the display name and primary entry point have changed to ChatGPT, while installation packages may still use the Codex name. The script supports both the old and new names.
+It has been verified with Windows Store versions `26.707.3748.0`, `26.930.4958.0`, `26.1007.9446.0`, and `26.1021.3705.0`, and the macOS app versions `26.707.31428` and `26.1013.31256` (Apple Silicon). In these versions, the display name and primary entry point have changed to ChatGPT, while installation packages may still use the Codex name. The script supports both the old and new names.
 
 ## Unlocked Features
 
@@ -31,6 +31,7 @@ It has been verified with Windows Store versions `26.707.3748.0`, `26.930.4958.0
 patch.py                  Main script: one-command workflow for both ChatGPT and Codex names (macOS / Windows)
 SKILL.md                  Full technical documentation, including the version-update troubleshooting guide
 tests/test_patch.py       Regression tests for models, reasoning effort, Fast (including 26.1007 custom providers), Browser, CUA, and platform workflows
+tests/test_saved_service_tier.py  Saved Fast request auth, capability limits, and Copilot exclusion
 ```
 
 ## Usage
@@ -141,5 +142,9 @@ After ChatGPT Codex is updated, JavaScript filenames (including hash suffixes) a
 Windows Store `26.1007.9446.0` returns a `serviceTierAccess` map instead of the older `isServiceTierAllowed` flag, and its request gate returns `null` instead of `false`. The adapter handles both forms and upgrades earlier API-key-only Fast patches to include no-login custom providers. After updating, run the complete `python patch.py` workflow and relaunch `ChatGPT Codex (Patched)`; `--assets` alone leaves the runtime's `app.asar` unchanged.
 
 Validation on 2026-10-15 passed 36 tests and 467 subtests. The full Windows rebuild applied 12 patches with no failures, and archive contents, the embedded ASAR hash, and basic startup checks passed. Executing the patched UI and request functions with local app-server responses confirmed Fast access for the custom-provider state and rejection when the server disables Fast; this check does not measure response speed or send a billable model request.
+
+Windows Store `26.1021.3705.0` (app `26.1021.31345`) also accepts Amazon Bedrock in the Fast UI and request gates. The adapter preserves that branch while adding API keys and eligible no-login providers. A separate `readServiceTier` method reads saved settings for queued turns; its account check is now patched too, while keeping the Copilot exclusion and downstream server/model restrictions.
+
+Validation on 2026-10-26 passed 42 tests. The complete Windows workflow applied 13 patches with no failures; a second inspection recognized all 13 as already applied. All four changed JavaScript files passed Node syntax checks and matched their packed ASAR entries. The executable's embedded header hash matched the rebuilt ASAR, and the original archive matched the backup. Extracted functions from the installed bundle passed 60 auth/server cases and a loading-state check using mocked backend responses. The patched processes started and remained responsive; no billable model request or response-speed measurement was performed.
 
 For Nowledge MCP settings that disappear when a configuration manager rewrites Codex settings, see the [configuration persistence investigation](docs/nowledge-mcp-persistence.md). The application patch itself does not manage MCP credentials.

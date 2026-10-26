@@ -7,7 +7,7 @@ description: |
   but hidden by experiment configuration, and remove API key gates from
   Fast/Speed, Browser, and Computer Use.
 metadata:
-  version: 4.6.0
+  version: 4.7.0
 ---
 
 # Patch ChatGPT Codex - Unlock API Key Mode Features
@@ -16,7 +16,7 @@ metadata:
 
 Remove desktop UI gates that still depend on ChatGPT sign-in context when using API key mode.
 
-Verified with Windows Store versions `26.707.3748.0`, `26.930.4958.0`, and `26.1007.9446.0`, and macOS app versions `26.707.31428` and `26.1013.31256` (Apple Silicon). The display name and main entry point have changed to ChatGPT, but package names and directories may still use Codex. The script reads the MSIX manifest or macOS `Info.plist` as appropriate and retains fallback support for the old name.
+Verified with Windows Store versions `26.707.3748.0`, `26.930.4958.0`, `26.1007.9446.0`, and `26.1021.3705.0`, and macOS app versions `26.707.31428` and `26.1013.31256` (Apple Silicon). The display name and main entry point have changed to ChatGPT, but package names and directories may still use Codex. The script reads the MSIX manifest or macOS `Info.plist` as appropriate and retains fallback support for the old name.
 
 ### Unlocked Features
 
@@ -191,6 +191,8 @@ Extend the existing ChatGPT/PAT condition with `auth?.authMethod === 'apikey'` a
 
 The model's `serviceTiers` supplies the available speed options. `configRequirements/read` supplies server restrictions such as `featureRequirements.fast_mode` and `ultrafast_mode`. Preserve both: enabling authentication must not invent a Fast tier or override an explicit server denial.
 
+Windows `26.1021` adds `amazonBedrock` to both the UI and request authentication allowlists. Preserve every existing PAT/Bedrock term, including when upgrading a previous API-key-only patch. Match these known authentication terms without depending on minified function names.
+
 ### 4. Fast Request Gate
 
 Find the service-tier request function and preserve its original rejection value. Older builds return `false`; `26.1007` returns `null` before resolving the access map. Add `apikey` to the existing ChatGPT/PAT allowlist without changing that return type.
@@ -204,6 +206,8 @@ In the `26.1007` merged chunk, the request helper shares its async account resol
 Validate the UI and request paths together. Cover null and undefined auth, explicit `requiresAuth` values, loading state, models with and without Fast, server denial, migration from earlier patches, and repeated execution. Windows `26.1007.9446.0` passed 36 tests and 467 subtests on 2026-10-15; the full rebuild applied 12 patches with no failures, and extracted real functions returned Fast access for local no-login provider data while still rejecting a simulated server denial.
 
 After an assets-only check, run the complete workflow to repack `app.asar` and update the embedded Windows hash, then relaunch the patched shortcut. Verify the packed code and matching integrity hash before reporting success. Function-level checks and a responsive renderer establish compatibility and startup; they do not establish model response speed or a completed billable Fast request.
+
+In `26.1021`, also inspect `async readServiceTier(...)` and `Failed to read saved service tier for request`. This separate saved-settings path supplies queued turns and checks the raw account type. Locate the account predicate inside that method and allow `apiKey` or `account == null && requiresOpenaiAuth === false`. Keep the existing ChatGPT/Bedrock checks, the local Copilot inference rejection, and downstream `configRequirements/read`, `config/read`, and `model/list` behavior. Require one method and one predicate; reject ambiguous or changed predicates. The Windows `26.1021.3705.0` rebuild applied 13 patches with zero failures, passed 42 tests, and verified packed code, integrity metadata, repeated inspection, and process startup on 2026-10-26.
 
 ### 5. Plugins
 

@@ -13,6 +13,7 @@ TEXT_FILES = (
     "docs/nowledge-mcp-persistence.md",
     "patch.py",
     "tests/test_patch.py",
+    "tests/test_saved_service_tier.py",
     "tests/test_source_encoding.py",
 )
 

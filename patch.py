@@ -548,13 +548,14 @@ def _service_tier_gate_patterns():
     original = re.compile(
         rf'(?<![a-zA-Z0-9_$])({identifier})=(?:true\|\|)?({identifier})\?\.authMethod==='
         rf'(?:`apikey`\|\|\2\?\.authMethod===)?`chatgpt`'
-        rf'(?P<personal_access>\|\|\2\?\.authMethod===`personalAccessToken`)?,'
+        rf'(?P<personal_access>(?:\|\|\2\?\.authMethod===`'
+        rf'(?:personalAccessToken|amazonBedrock)`)*),'
         rf'({identifier})=\2\?\.authMethod\?\?null'
     )
     patched = re.compile(
         rf'(?<![a-zA-Z0-9_$])({identifier})=(?:true\|\|)?({identifier})\?\.authMethod===`apikey`\|\|'
         rf'\2\?\.authMethod===`chatgpt`'
-        rf'(?:\|\|\2\?\.authMethod===`personalAccessToken`)?'
+        rf'(?:\|\|\2\?\.authMethod===`(?:personalAccessToken|amazonBedrock)`)*'
         rf'\|\|\2\?\.authMethod==null&&\2\?\.requiresAuth===!1,'
         rf'({identifier})=\2\?\.authMethod\?\?null'
     )
@@ -607,7 +608,7 @@ def apply_custom_provider_fast_request_patch(fp):
         rf'(?P<resolver>{identifier})\((?P=scope),(?P=host)'
         rf'(?P<enabled>,!0)?(?P<close>\));if\((?P=method)!==`chatgpt`'
         rf'(?:&&(?P=method)!==`apikey`)?'
-        rf'(?:&&(?P=method)!==`personalAccessToken`)?\)return(?:!1| null);'
+        rf'(?:&&(?P=method)!==`(?:personalAccessToken|amazonBedrock)`)*\)return(?:!1| null);'
     )
     candidates = []
     for caller in caller_pattern.finditer(content):
@@ -687,6 +688,70 @@ def _function_spans(content):
     for index, match in enumerate(matches):
         end = matches[index + 1].start() if index + 1 < len(matches) else len(content)
         yield match.start(), end
+
+
+def apply_saved_service_tier_auth_patch(assets):
+    """Enable API providers in the saved-tier reader used by queued turns."""
+    name = "Saved service tier request auth"
+    identifier = r'[a-zA-Z_$][a-zA-Z0-9_$]*'
+    candidates = []
+    for fp in sorted(glob.glob(os.path.join(assets, "*.js"))):
+        with open(fp, encoding="utf-8") as fh:
+            content = fh.read()
+        if "readServiceTier(" not in content:
+            continue
+        for signature in re.finditer(
+                rf'async readServiceTier\({identifier}\)\{{', content):
+            end = _js_block_end(content, signature.end() - 1)
+            if end is None:
+                mark_missing(name, "Incomplete saved-tier reader")
+                return
+            body = content[signature.end():end]
+            if "isUsingCopilotInference" in body and ".getAccount(" in body:
+                candidates.append((fp, content, signature.end(), end))
+    if not candidates:
+        return  # Older versions do not have this separate auth path.
+    if len(candidates) != 1:
+        mark_missing(name, f"Found {len(candidates)} saved-tier readers")
+        return
+    fp, content, start, end = candidates[0]
+    body = content[start:end]
+    # Anchor to the account response inside readServiceTier, not another
+    # account predicate in the merged bundle. Keep the Copilot early return
+    # and the downstream configRequirements/read + model/list checks intact.
+    prefix = (
+        rf'let (?P<response>{identifier})=await {identifier}\.getAccount\('
+        rf'\{{priority:`critical`\}}\);return '
+        rf'(?P=response)\.account\?\.type===`chatgpt`\|\|'
+        rf'(?P=response)\.account\?\.type===`amazonBedrock`'
+    )
+    original = re.compile(prefix + r'(?=\})')
+    patched = re.compile(
+        prefix + rf'\|\|(?P=response)\.account\?\.type===`apiKey`\|\|'
+        rf'(?P=response)\.account==null&&'
+        rf'(?P=response)\.requiresOpenaiAuth===!1(?=\}})'
+    )
+    matches = list(original.finditer(body))
+    done = list(patched.finditer(body))
+    if len(done) == 1 and not matches:
+        mark_satisfied(fp, name, "Already applied")
+        return
+    if len(matches) != 1 or done:
+        mark_missing(name, "Target structure mismatch")
+        return
+    match = matches[0]
+    response = match.group("response")
+    replacement = (
+        f"{match.group(0)}||{response}.account?.type===`apiKey`||"
+        f"{response}.account==null&&{response}.requiresOpenaiAuth===!1"
+    )
+    if not DRY_RUN:
+        content = content[:start + match.start()] + replacement + content[
+            start + match.end():]
+        with open(fp, "w", encoding="utf-8") as fh:
+            fh.write(content)
+    results["applied"].append(f"{os.path.basename(fp)}: {name}")
+    print(f"    [OK]   {name}")
 
 
 def _statsig_gate_assignment(function_body, feature_name, availability_field):
@@ -1787,7 +1852,7 @@ def step_patch_js(assets):
         apply_patch(request_tier_fp, "Fast request service tier gate",
             None, None,
             r'if\(([a-zA-Z_$][a-zA-Z0-9_$]*)!==`chatgpt`'
-            r'(?P<personal_access>&&\1!==`personalAccessToken`)?\)'
+            r'(?P<personal_access>(?:&&\1!==`(?:personalAccessToken|amazonBedrock)`)*)\)'
             r'return(?P<denied>!1| null);',
             lambda m: (
                 f"if({m.group(1)}!==`chatgpt`&&{m.group(1)}!==`apikey`"
@@ -1795,8 +1860,9 @@ def step_patch_js(assets):
             ),
             skip_regex=(
                 r'if\(([a-zA-Z_$][a-zA-Z0-9_$]*)!==`chatgpt`&&\1!==`apikey`'
-                r'(?:&&\1!==`personalAccessToken`)?\)return(?:!1| null);'))
+                r'(?:&&\1!==`(?:personalAccessToken|amazonBedrock)`)*\)return(?:!1| null);'))
         apply_custom_provider_fast_request_patch(request_tier_fp)
+    apply_saved_service_tier_auth_patch(assets)
 
     # -- Module 2: latest models and reasoning efforts (2 patches) ------
     # API key sessions do not receive the ChatGPT Statsig hidden-model

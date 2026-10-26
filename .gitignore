@@ -7,3 +7,4 @@ __pycache__/
 # macOS and local patch output
 .DS_Store
 *.app/
+.tmp/

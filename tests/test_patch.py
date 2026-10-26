@@ -789,8 +789,10 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
             self.assertEqual(patched, target.read_bytes())
 
     def test_custom_provider_fast_ui_and_request_preserve_capabilities(self):
-        for previous_patch in (False, True):
-            with self.subTest(previous_patch=previous_patch), \
+        for previous_patch, bedrock_supported in (
+                (False, False), (False, True), (True, False), (True, True)):
+            with self.subTest(previous_patch=previous_patch,
+                              bedrock_supported=bedrock_supported), \
                     tempfile.TemporaryDirectory() as tmp:
                 assets = Path(tmp)
                 fixture = write_supported_assets(assets)
@@ -841,6 +843,16 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
                     "isLoading:true},{fast:true}).serviceTierAccess,"
                     "missing:ui(null,{fast:true}).serviceTierAccess}))"
                 )
+                if bedrock_supported:
+                    source = source.replace(
+                        "auth?.authMethod===`personalAccessToken`,",
+                        "auth?.authMethod===`personalAccessToken`||"
+                        "auth?.authMethod===`amazonBedrock`,",
+                    ).replace(
+                        "n!==`personalAccessToken`)return null;",
+                        "n!==`personalAccessToken`&&"
+                        "n!==`amazonBedrock`)return null;",
+                    )
                 if previous_patch:
                     source = source.replace(
                         "gate=auth?.authMethod===`chatgpt`",
@@ -871,6 +883,8 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
                     with self.subTest(row=row):
                         allowed = row["method"] in (
                             "apikey", "chatgpt", "personalAccessToken"
+                        ) or (
+                            bedrock_supported and row["method"] == "amazonBedrock"
                         ) or (row["method"] in ("null", "undefined") and
                               row["requiresAuth"] == "false")
                         expected = allowed and row["fast"] and row["supported"]
@@ -2019,21 +2033,35 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
                 helpers_dir = bundle / "Versions" / "155.0" / "Helpers"
                 renderer = helpers_dir / "Codex (Renderer).app"
                 renderer.mkdir(parents=True)
-                # Versions/Current points at the same directory; the helper
-                # list must contain each path exactly once.
-                os.symlink(renderer, helpers_dir / "softlink.app")
                 (helpers_dir / "app_mode_loader").touch()
                 (helpers_dir / "web_app_shortcut_copier").touch()
                 (helpers_dir / "browser_crashpad_handler").touch()
 
+                expected = [
+                    str(renderer),
+                    str(helpers_dir / "app_mode_loader"),
+                    str(helpers_dir / "web_app_shortcut_copier"),
+                ]
                 self.assertEqual(
                     patch_module._helper_bundles_for(str(bundle)),
-                    [
-                        str(renderer),
-                        str(helpers_dir / "app_mode_loader"),
-                        str(helpers_dir / "web_app_shortcut_copier"),
-                    ],
+                    expected,
                 )
+
+                # Exercise the symlink exclusion without requiring Windows
+                # Developer Mode or the privilege to create real symlinks.
+                softlink = helpers_dir / "softlink.app"
+                softlink.mkdir()
+                real_islink = patch_module.os.path.islink
+                with mock.patch.object(
+                    patch_module.os.path,
+                    "islink",
+                    side_effect=lambda path: Path(path) == softlink or real_islink(path),
+                ) as islink:
+                    self.assertEqual(
+                        patch_module._helper_bundles_for(str(bundle)),
+                        expected,
+                    )
+                    islink.assert_any_call(str(softlink))
 
     def test_macos_signing_failure_stops_the_run(self):
         with loaded_patch_module() as patch_module:
