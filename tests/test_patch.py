@@ -1337,6 +1337,75 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
             self.assertIn("$lnk.TargetPath='", command[3])
             self.assertIn("$lnk.Arguments='--user-data-dir=\"", command[3])
 
+    def test_image_generation_binary_patch_is_atomic_idempotent_and_fails_closed(self):
+        with loaded_patch_module() as patch_module, tempfile.TemporaryDirectory() as tmp:
+            exe = Path(tmp) / "codex.exe"
+            originals = [
+                original
+                for _, original, _ in patch_module._IMAGE_GENERATION_BINARY_PATCHES
+            ]
+            patched_patterns = [
+                patched
+                for _, _, patched in patch_module._IMAGE_GENERATION_BINARY_PATCHES
+            ]
+            original_image = b"MZprefix" + b"separator".join(originals) + b"suffix"
+            expected_image = original_image
+            for original, patched in zip(originals, patched_patterns):
+                expected_image = expected_image.replace(original, patched)
+            exe.write_bytes(original_image)
+
+            patch_module.DRY_RUN = False
+            patch_module.results = {"applied": [], "skipped": [], "failed": []}
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertTrue(
+                    patch_module.apply_image_generation_binary_patch(str(exe))
+                )
+            self.assertEqual(expected_image, exe.read_bytes())
+            self.assertEqual(
+                original_image, Path(str(exe) + ".imagegen.bak").read_bytes()
+            )
+            self.assertEqual(
+                len(patch_module._IMAGE_GENERATION_BINARY_PATCHES),
+                len(patch_module.results["applied"]),
+            )
+            self.assertEqual([], patch_module.results["failed"])
+
+            patch_module.results = {"applied": [], "skipped": [], "failed": []}
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertTrue(
+                    patch_module.apply_image_generation_binary_patch(str(exe))
+                )
+            self.assertEqual(expected_image, exe.read_bytes())
+            self.assertEqual(
+                len(patch_module._IMAGE_GENERATION_BINARY_PATCHES),
+                len(patch_module.results["skipped"]),
+            )
+
+            ambiguous = Path(tmp) / "ambiguous.exe"
+            ambiguous_image = (
+                b"MZprefix" + originals[0] + b"duplicate" + originals[0]
+                + b"separator" + b"separator".join(originals[1:]) + b"suffix"
+            )
+            ambiguous.write_bytes(ambiguous_image)
+            patch_module.results = {"applied": [], "skipped": [], "failed": []}
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertFalse(
+                    patch_module.apply_image_generation_binary_patch(str(ambiguous))
+                )
+            self.assertEqual(ambiguous_image, ambiguous.read_bytes())
+            self.assertFalse(Path(str(ambiguous) + ".imagegen.bak").exists())
+            self.assertEqual(1, len(patch_module.results["failed"]))
+
+            store_copy = Path(tmp) / "store-codex.exe"
+            store_copy.write_bytes(original_image)
+            patch_module.results = {"applied": [], "skipped": [], "failed": []}
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertTrue(patch_module.apply_image_generation_binary_patch(
+                    str(store_copy), create_backup=False
+                ))
+            self.assertEqual(expected_image, store_copy.read_bytes())
+            self.assertFalse(Path(str(store_copy) + ".imagegen.bak").exists())
+
     def test_windows_asar_integrity_hash_updates_only_the_copy(self):
         with loaded_patch_module() as patch_module, tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

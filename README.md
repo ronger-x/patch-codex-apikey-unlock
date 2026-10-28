@@ -1,6 +1,6 @@
 # ChatGPT Codex - Full Feature Unlock for API Key Mode
 
-This project targets the Codex desktop app whose display name has been changed to **ChatGPT**. It unlocks the model list, reasoning effort levels, service tiers, and other features in API key mode.
+This project targets the Codex desktop app whose display name has been changed to **ChatGPT**. It unlocks the model list, reasoning effort levels, service tiers, built-in image generation, and other features in API key mode.
 
 It has been verified with Windows Store versions `26.707.3748.0`, `26.930.4958.0`, `26.1007.9446.0`, and `26.1021.3705.0`, and the macOS app versions `26.707.31428` and `26.1013.31256` (Apple Silicon). In these versions, the display name and primary entry point have changed to ChatGPT, while installation packages may still use the Codex name. The script supports both the old and new names.
 
@@ -19,6 +19,7 @@ It has been verified with Windows Store versions `26.707.3748.0`, `26.930.4958.0
 | Voice input/dictation | Expands availability to `chatgpt \|\| apikey` |
 | Usage/billing settings | Expands availability to `chatgpt \|\| apikey` |
 | i18n languages | Bypasses the Statsig experiment gate and forces the feature on |
+| Built-in image generation | On Windows `26.1021`, exposes `image_gen.imagegen` to eligible API-key/custom-provider sessions while retaining feature, plan, provider-capability, and model-modality checks |
 
 ## Prerequisites
 
@@ -83,7 +84,7 @@ python3 patch.py --assets "/Applications/ChatGPT-Codex-Patched.app/Contents/Reso
 python3 patch.py --assets "$env:LOCALAPPDATA\Programs\ChatGPT-Codex-Patched\resources\app\webview\assets"
 ```
 
-`--assets` does not repackage `app.asar`; it is intended for version adaptation and testing. To apply the changes to the Owl runtime, run the complete `python3 patch.py` workflow.
+`--assets` does not repackage `app.asar` or patch the native `codex.exe`; it is intended for JavaScript version adaptation and testing. To apply the changes to the Owl runtime, including built-in image generation, run the complete `python3 patch.py` workflow.
 
 ### Dry Run (No Files Written)
 
@@ -117,7 +118,9 @@ gives the patched desktop shortcut a separate `--user-data-dir`, so an already
 running official instance cannot claim the patched copy's single-instance lock.
 Because the copied executable is modified, Windows may report its vendor
 signature as invalid; the official Store installation keeps its original
-signature and remains untouched.
+signature and remains untouched. The Windows 26.1021 image-generation patch
+also modifies the copied `resources/codex.exe`, invalidating that copy's
+vendor signature.
 
 **Traditional Windows installation:**
 
@@ -125,6 +128,7 @@ signature and remains untouched.
 cd "$env:LOCALAPPDATA\Programs\ChatGPT\resources" # The legacy-branded directory is Codex
 Remove-Item -Recurse -Force app
 if (Test-Path app.asar.bak) { Copy-Item app.asar.bak app.asar -Force }
+if (Test-Path codex.exe.imagegen.bak) { Copy-Item codex.exe.imagegen.bak codex.exe -Force }
 ```
 
 ## config.toml
@@ -134,6 +138,14 @@ Keep your existing API provider configuration. The patch does not hard-code mode
 Custom providers with `requires_openai_auth = false` can report no OpenAI account and a null authentication method. The reasoning-effort patch also recognizes this custom-provider state, so Max and Ultra are not hidden merely because there is no OpenAI login. Models that do not declare Ultra support still omit that option.
 
 Fast also recognizes this state: the UI accepts `authMethod == null` only when `requiresAuth === false`, and the request path checks `account == null` together with `requiresOpenaiAuth === false`. Fast still requires a matching entry in the model's `serviceTiers` and server permission from `configRequirements/read`. A model without Fast support, or a server response with `fast_mode: false`, keeps the option unavailable.
+
+### Built-in Image Generation
+
+Windows app `26.1021.31345` bundles Codex CLI `0.164.0-alpha.11.1`, whose native app-server has two additional authentication gates around the image extension. The complete workflow patches both gates in `resources/codex.exe` with unique, version-specific machine-code signatures. It validates every original or already-patched signature before writing, prepares the result in a temporary copy, and atomically replaces the executable. Traditional installs retain `codex.exe.imagegen.bak`; Store installs already keep the official package unchanged.
+
+The patch does not invent image support. It retains the `[features] image_generation = true` flag, Free-plan exclusion, provider capability, and model image-input checks. In this version, Responses-compatible custom providers default to the image-generation capability, but they must still implement compatible `/images/generations` and `/images/edits` endpoints. See the [official OpenAI image-generation guide](https://developers.openai.com/api/docs/guides/image-generation).
+
+This native patch is currently verified only for Windows `26.1021`; macOS is left unchanged. A version drift, missing signature, or duplicate signature fails closed before ASAR repackaging.
 
 ## Version Updates
 
@@ -146,5 +158,7 @@ Validation on 2026-10-15 passed 36 tests and 467 subtests. The full Windows rebu
 Windows Store `26.1021.3705.0` (app `26.1021.31345`) also accepts Amazon Bedrock in the Fast UI and request gates. The adapter preserves that branch while adding API keys and eligible no-login providers. A separate `readServiceTier` method reads saved settings for queued turns; its account check is now patched too, while keeping the Copilot exclusion and downstream server/model restrictions.
 
 Validation on 2026-10-26 passed 42 tests. The complete Windows workflow applied 13 patches with no failures; a second inspection recognized all 13 as already applied. All four changed JavaScript files passed Node syntax checks and matched their packed ASAR entries. The executable's embedded header hash matched the rebuilt ASAR, and the original archive matched the backup. Extracted functions from the installed bundle passed 60 auth/server cases and a loading-state check using mocked backend responses. The patched processes started and remained responsive; no billable model request or response-speed measurement was performed.
+
+Validation on 2026-10-28 passed 43 tests. The complete Windows `26.1021.3705.0` workflow applied 15 patches with no failures, including both native image-generation gates; a second native inspection recognized both as already applied. The rebuilt ASAR header hash occurred exactly once in the copied `ChatGPT.exe`, the patched desktop process remained alive during a startup smoke test, and a local mock Responses endpoint captured exactly one non-billable request. Its 10-tool payload contained the `image_gen` namespace with the `imagegen` function. No `/images/*` request or external model request was sent.
 
 For Nowledge MCP settings that disappear when a configuration manager rewrites Codex settings, see the [configuration persistence investigation](docs/nowledge-mcp-persistence.md). The application patch itself does not manage MCP credentials.

@@ -5,9 +5,9 @@ description: |
   Support both ChatGPT and Codex branding, show the latest hidden models
   returned by app-server, expose reasoning effort levels declared by models
   but hidden by experiment configuration, and remove API key gates from
-  Fast/Speed, Browser, and Computer Use.
+  Fast/Speed, Browser, Computer Use, and built-in image generation.
 metadata:
-  version: 4.7.0
+  version: 4.8.0
 ---
 
 # Patch ChatGPT Codex - Unlock API Key Mode Features
@@ -32,6 +32,7 @@ Verified with Windows Store versions `26.707.3748.0`, `26.930.4958.0`, `26.1007.
 | 8 | Voice input/dictation | ChatGPT mode only | Expand to `chatgpt \|\| apikey` |
 | 9 | Usage/billing settings | ChatGPT mode only | Expand to `chatgpt \|\| apikey` |
 | 10 | i18n localization | API key mode has no Statsig user context | Force enablement |
+| 11 | Built-in image generation | Native extension creation and tool exposure require OpenAI/Codex authentication | On Windows 26.1021, remove only the two authentication-type gates and retain feature, plan, provider-capability, and model-modality checks |
 
 ## Prerequisites
 
@@ -280,6 +281,26 @@ grep -rn "enable_i18n" *.js
 # Key point: without user context, the Statsig experiment gate returns false by default.
 ```
 
+### 11. Built-in Image Generation
+
+Windows app `26.1021.31345` ships Codex CLI `0.164.0-alpha.11.1`. Its native app-server contains two independent image-generation gates:
+
+1. `ext/image-generation/src/extension.rs` creates the extension only for the OpenAI provider, providers requiring OpenAI authentication, or Actor Authorization providers.
+2. `core/src/tools/spec_plan.rs::image_generation_available` repeats an authentication/backend check after the real feature, plan, provider-capability, and model-modality checks.
+
+For a custom provider with `requires_openai_auth = false`, patch only those two authentication-type decisions. Do not bypass these remaining checks:
+
+- `Feature::ImageGeneration` is enabled (`[features] image_generation = true`).
+- The account is not on the Free plan.
+- The provider advertises `image_generation` capability.
+- The selected model accepts image input.
+
+The image tool uses the configured provider's Images client. Responses-compatible custom providers default to the image-generation capability in this version, but the provider must still implement compatible `/images/generations` and `/images/edits` endpoints; exposing the tool does not emulate them. The official API behavior is documented at <https://developers.openai.com/api/docs/guides/image-generation>.
+
+The Windows binary patch must use full, version-specific machine-code signatures for both the original and already-patched states. Require exactly one state per gate, validate every gate before writing, write through a temporary copy, and replace atomically. Reject missing or duplicate matches. Preserve `codex.exe.imagegen.bak` for traditional-install rollback. `--assets` cannot apply or validate this native patch.
+
+This patch is currently verified only for Windows `26.1021`. Do not apply its PE signatures to macOS Mach-O or the bundled Linux/WSL binary. On a new Codex version, rebuild the exact source tag with symbols, locate both source decisions, derive new contextual signatures, and verify them against the shipped `resources/codex.exe` before updating the script.
+
 ## How It Works
 
 | Operation | Reason | Location |
@@ -296,6 +317,7 @@ grep -rn "enable_i18n" *.js
 | Allow request-level service tiers | Showing the Fast option alone does not change actual requests | `read-service-tier-for-request-*` |
 | Enable the desktop availability gate | Bundled plugins are removed when API key mode has no Statsig user context | Desktop feature chunk |
 | Enable the Computer Use runtime gate | A Node runtime must still be selected after availability is established | Desktop feature sync chunk |
+| Unlock built-in image generation | The native app-server creates and exposes the image extension only for selected authentication types | `resources/codex.exe` (Windows 26.1021 only) |
 | Fall back when the Browser signing identity is missing | An ad-hoc outer app prevents complete responsible-process identity resolution | `.vite/build/main-*` (macOS only) |
 | Bypass Statsig experiments | API key mode has no Statsig user context, so i18n/feature experiments default to disabled | webview JS |
 | Bypass `authMethod` gates | Multiple features check `=== 'chatgpt'`, excluding API key mode | webview JS |

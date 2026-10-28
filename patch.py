@@ -13,6 +13,7 @@ Usage:
 import argparse
 import glob
 import hashlib
+import mmap
 import os
 import plistlib
 import re
@@ -346,7 +347,7 @@ def step_copy_store(store_root):
     resources  = os.path.join(patch_root, "resources")
     exe        = os.path.join(patch_root, exe_name)
 
-    print(f"[3] Copying the app directory (about 300 MB)...")
+    print(f"[3] Copying the app directory...")
     print(f"    {src}")
     print(f"    -> {patch_root}")
 
@@ -374,7 +375,7 @@ def step_copy_store(store_root):
     # of files and flooding the terminal can make the workflow look hung (or
     # cause an embedding runner to truncate/abort the process).  Capturing also
     # preserves the output for the failure path below.
-    print("    Copying; this may take 1-2 minutes...")
+    print("    Copying; current builds may take several minutes...")
     rc, output = run_cmd(
         ["robocopy", src, patch_root,
          "/E", "/COPY:DAT", "/NP", "/NDL", "/NJH", "/NJS"],
@@ -2158,10 +2159,141 @@ def step_patch_js(assets):
         apply_windows_app_user_model_id_patch(main_build)
 
 
+_IMAGE_GENERATION_BINARY_PATCHES = (
+    (
+        "Image generation extension provider gate",
+        bytes.fromhex(
+            "40 88 be 68 03 00 00 0f 10 85 d8 02 00 00"
+        ),
+        bytes.fromhex(
+            "c6 86 68 03 00 00 01 0f 10 85 d8 02 00 00"
+        ),
+    ),
+    (
+        "Image generation tool authentication gate",
+        bytes.fromhex(
+            "48 8b 85 28 09 00 00 80 b8 12 03 00 00 00 74 35 "
+            "48 8b 85 08 09 00 00"
+        ),
+        bytes.fromhex(
+            "48 8b 85 28 09 00 00 e9 f1 fb ff ff 90 90 90 90 "
+            "48 8b 85 08 09 00 00"
+        ),
+    ),
+)
+
+
+def _binary_pattern_offsets(image, pattern, limit=2):
+    """Return up to limit offsets without reading the executable into RAM."""
+    offsets = []
+    start = 0
+    while len(offsets) < limit:
+        offset = image.find(pattern, start)
+        if offset < 0:
+            break
+        offsets.append(offset)
+        start = offset + 1
+    return offsets
+
+
+def apply_image_generation_binary_patch(exe_path, create_backup=True):
+    """Unlock the built-in image extension while failing closed on drift.
+
+    Every original or already-patched pattern must occur exactly once before
+    anything is written. The replacement is then prepared in a temporary copy
+    and atomically installed, so an interrupted run cannot leave one gate
+    patched and another gate untouched.
+    """
+    patch_name = "Built-in image generation"
+    bn = os.path.basename(exe_path)
+    try:
+        with open(exe_path, "rb") as fh:
+            if fh.read(2) != b"MZ":
+                mark_missing(f"{bn}: {patch_name}", "Target is not a PE executable")
+                return False
+            fh.seek(0)
+            with mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as image:
+                states = []
+                for name, original, patched in _IMAGE_GENERATION_BINARY_PATCHES:
+                    original_offsets = _binary_pattern_offsets(image, original)
+                    patched_offsets = _binary_pattern_offsets(image, patched)
+                    if len(original_offsets) == 1 and not patched_offsets:
+                        states.append((name, "apply", original_offsets[0], patched))
+                    elif len(patched_offsets) == 1 and not original_offsets:
+                        states.append((name, "skip", patched_offsets[0], patched))
+                    else:
+                        reason = (
+                            "Expected one original or patched machine-code pattern; "
+                            f"found original={len(original_offsets)} "
+                            f"patched={len(patched_offsets)}"
+                        )
+                        mark_missing(f"{bn}: {patch_name}", reason)
+                        return False
+    except (OSError, ValueError) as exc:
+        mark_missing(f"{bn}: {patch_name}", f"Unable to inspect executable: {exc}")
+        return False
+
+    pending = [state for state in states if state[1] == "apply"]
+    if pending and not DRY_RUN:
+        backup = exe_path + ".imagegen.bak"
+        temp_path = None
+        try:
+            if create_backup and not os.path.isfile(backup):
+                shutil.copy2(exe_path, backup)
+            fd, temp_path = tempfile.mkstemp(
+                prefix=f".{bn}.imagegen-", suffix=".tmp",
+                dir=os.path.dirname(os.path.abspath(exe_path)),
+            )
+            os.close(fd)
+            shutil.copy2(exe_path, temp_path)
+            with open(temp_path, "r+b") as fh:
+                for _, _, offset, patched in pending:
+                    fh.seek(offset)
+                    fh.write(patched)
+                fh.flush()
+                os.fsync(fh.fileno())
+                for _, _, offset, patched in states:
+                    fh.seek(offset)
+                    if fh.read(len(patched)) != patched:
+                        raise OSError("Post-patch verification failed")
+            os.replace(temp_path, exe_path)
+            temp_path = None
+        except OSError as exc:
+            if temp_path and os.path.exists(temp_path):
+                os.unlink(temp_path)
+            mark_missing(f"{bn}: {patch_name}", f"Unable to update executable: {exc}")
+            return False
+
+    for name, state, _, _ in states:
+        item = f"{bn}: {name}"
+        if state == "skip":
+            results["skipped"].append(item)
+            print(f"    [SKIP] {name}")
+        else:
+            results["applied"].append(item)
+            print(f"    [OK]   {name}")
+    return True
+
+
+def step_patch_codex_image_generation(resources_dir, create_backup=True):
+    """Patch the native Windows Codex app-server shipped with the desktop app."""
+    print("\n[5.25] Unlocking built-in image generation...")
+    if not IS_WINDOWS:
+        print("    [SKIP] Native image-generation patch currently targets Windows PE")
+        return True
+    codex_exe = os.path.join(resources_dir, "codex.exe")
+    if not os.path.isfile(codex_exe):
+        mark_missing("Built-in image generation", f"Executable not found: {codex_exe}")
+        return False
+    return apply_image_generation_binary_patch(
+        codex_exe, create_backup=create_backup
+    )
+
+
 def _require_successful_js_patch():
-    """Stop a full build before packaging or signing any partial JS result."""
+    """Stop a full build before packaging or signing any partial result."""
     if results["failed"]:
-        _die("JavaScript patch validation failed; packaging and signing stopped.")
+        _die("Patch validation failed; packaging and signing stopped.")
 
 
 # ================================================================
@@ -2789,6 +2921,9 @@ else:
         if not os.path.isdir(assets):
             _die(f"Assets directory not found: {assets}")
         step_patch_js(assets)
+        step_patch_codex_image_generation(
+            resources_dir, create_backup=not is_store
+        )
         _require_successful_js_patch()
 
     # Repack the patched app/ directory because owl loads only app.asar and
