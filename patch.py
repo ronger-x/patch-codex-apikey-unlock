@@ -2159,25 +2159,55 @@ def step_patch_js(assets):
         apply_windows_app_user_model_id_patch(main_build)
 
 
-_IMAGE_GENERATION_BINARY_PATCHES = (
+_IMAGE_GENERATION_BINARY_PATCH_SETS = (
     (
-        "Image generation extension provider gate",
-        bytes.fromhex(
-            "40 88 be 68 03 00 00 0f 10 85 d8 02 00 00"
-        ),
-        bytes.fromhex(
-            "c6 86 68 03 00 00 01 0f 10 85 d8 02 00 00"
+        "desktop 26.1021 / codex-cli 0.164.0-alpha.11.1",
+        (
+            (
+                "Image generation extension provider gate",
+                bytes.fromhex(
+                    "40 88 be 68 03 00 00 0f 10 85 d8 02 00 00"
+                ),
+                bytes.fromhex(
+                    "c6 86 68 03 00 00 01 0f 10 85 d8 02 00 00"
+                ),
+            ),
+            (
+                "Image generation tool authentication gate",
+                bytes.fromhex(
+                    "48 8b 85 28 09 00 00 80 b8 12 03 00 00 00 74 35 "
+                    "48 8b 85 08 09 00 00"
+                ),
+                bytes.fromhex(
+                    "48 8b 85 28 09 00 00 e9 f1 fb ff ff 90 90 90 90 "
+                    "48 8b 85 08 09 00 00"
+                ),
+            ),
         ),
     ),
     (
-        "Image generation tool authentication gate",
-        bytes.fromhex(
-            "48 8b 85 28 09 00 00 80 b8 12 03 00 00 00 74 35 "
-            "48 8b 85 08 09 00 00"
-        ),
-        bytes.fromhex(
-            "48 8b 85 28 09 00 00 e9 f1 fb ff ff 90 90 90 90 "
-            "48 8b 85 08 09 00 00"
+        "desktop 26.1023 / codex-cli 0.165.0-alpha.1.2",
+        (
+            (
+                "Image generation extension provider gate",
+                bytes.fromhex(
+                    "40 88 be 68 03 00 00 0f 10 85 d8 02 00 00"
+                ),
+                bytes.fromhex(
+                    "c6 86 68 03 00 00 01 0f 10 85 d8 02 00 00"
+                ),
+            ),
+            (
+                "Image generation tool authentication gate",
+                bytes.fromhex(
+                    "48 8b 85 68 06 00 00 80 b8 12 03 00 00 00 74 35 "
+                    "48 8b 85 98 06 00 00"
+                ),
+                bytes.fromhex(
+                    "48 8b 85 68 06 00 00 e9 f1 fb ff ff 90 90 90 90 "
+                    "48 8b 85 98 06 00 00"
+                ),
+            ),
         ),
     ),
 )
@@ -2213,22 +2243,43 @@ def apply_image_generation_binary_patch(exe_path, create_backup=True):
                 return False
             fh.seek(0)
             with mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as image:
-                states = []
-                for name, original, patched in _IMAGE_GENERATION_BINARY_PATCHES:
-                    original_offsets = _binary_pattern_offsets(image, original)
-                    patched_offsets = _binary_pattern_offsets(image, patched)
-                    if len(original_offsets) == 1 and not patched_offsets:
-                        states.append((name, "apply", original_offsets[0], patched))
-                    elif len(patched_offsets) == 1 and not original_offsets:
-                        states.append((name, "skip", patched_offsets[0], patched))
+                compatible_sets = []
+                mismatch_details = []
+                for version, patches in _IMAGE_GENERATION_BINARY_PATCH_SETS:
+                    states = []
+                    mismatches = []
+                    for name, original, patched in patches:
+                        original_offsets = _binary_pattern_offsets(image, original)
+                        patched_offsets = _binary_pattern_offsets(image, patched)
+                        if len(original_offsets) == 1 and not patched_offsets:
+                            states.append((name, "apply", original_offsets[0], patched))
+                        elif len(patched_offsets) == 1 and not original_offsets:
+                            states.append((name, "skip", patched_offsets[0], patched))
+                        else:
+                            mismatches.append(
+                                f"{name}: original={len(original_offsets)} "
+                                f"patched={len(patched_offsets)}"
+                            )
+                    if mismatches:
+                        mismatch_details.append(
+                            f"{version} ({'; '.join(mismatches)})"
+                        )
+                    else:
+                        compatible_sets.append((version, states))
+                if len(compatible_sets) != 1:
+                    if compatible_sets:
+                        reason = (
+                            "Multiple supported machine-code signature sets matched: "
+                            + ", ".join(version for version, _ in compatible_sets)
+                        )
                     else:
                         reason = (
-                            "Expected one original or patched machine-code pattern; "
-                            f"found original={len(original_offsets)} "
-                            f"patched={len(patched_offsets)}"
+                            "No supported machine-code signature set matched. "
+                            + " | ".join(mismatch_details)
                         )
-                        mark_missing(f"{bn}: {patch_name}", reason)
-                        return False
+                    mark_missing(f"{bn}: {patch_name}", reason)
+                    return False
+                version, states = compatible_sets[0]
     except (OSError, ValueError) as exc:
         mark_missing(f"{bn}: {patch_name}", f"Unable to inspect executable: {exc}")
         return False
@@ -2264,6 +2315,7 @@ def apply_image_generation_binary_patch(exe_path, create_backup=True):
             mark_missing(f"{bn}: {patch_name}", f"Unable to update executable: {exc}")
             return False
 
+    print(f"    Signature set: {version}")
     for name, state, _, _ in states:
         item = f"{bn}: {name}"
         if state == "skip":

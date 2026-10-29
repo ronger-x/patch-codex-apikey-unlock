@@ -2,7 +2,7 @@
 
 This project targets the Codex desktop app whose display name has been changed to **ChatGPT**. It unlocks the model list, reasoning effort levels, service tiers, built-in image generation, and other features in API key mode.
 
-It has been verified with Windows Store versions `26.707.3748.0`, `26.930.4958.0`, `26.1007.9446.0`, and `26.1021.3705.0`, and the macOS app versions `26.707.31428` and `26.1013.31256` (Apple Silicon). In these versions, the display name and primary entry point have changed to ChatGPT, while installation packages may still use the Codex name. The script supports both the old and new names.
+It has been verified with Windows Store versions `26.707.3748.0`, `26.930.4958.0`, `26.1007.9446.0`, `26.1021.3705.0`, and `26.1023.6621.0`, and the macOS app versions `26.707.31428` and `26.1013.31256` (Apple Silicon). In these versions, the display name and primary entry point have changed to ChatGPT, while installation packages may still use the Codex name. The script supports both the old and new names.
 
 ## Unlocked Features
 
@@ -19,7 +19,7 @@ It has been verified with Windows Store versions `26.707.3748.0`, `26.930.4958.0
 | Voice input/dictation | Expands availability to `chatgpt \|\| apikey` |
 | Usage/billing settings | Expands availability to `chatgpt \|\| apikey` |
 | i18n languages | Bypasses the Statsig experiment gate and forces the feature on |
-| Built-in image generation | On Windows `26.1021`, exposes `image_gen.imagegen` to eligible API-key/custom-provider sessions while retaining feature, plan, provider-capability, and model-modality checks |
+| Built-in image generation | On Windows `26.1021` and `26.1023`, exposes `image_gen.imagegen` to eligible API-key/custom-provider sessions while retaining feature, plan, provider-capability, and model-modality checks |
 
 ## Prerequisites
 
@@ -118,7 +118,7 @@ gives the patched desktop shortcut a separate `--user-data-dir`, so an already
 running official instance cannot claim the patched copy's single-instance lock.
 Because the copied executable is modified, Windows may report its vendor
 signature as invalid; the official Store installation keeps its original
-signature and remains untouched. The Windows 26.1021 image-generation patch
+signature and remains untouched. The Windows 26.1021/26.1023 image-generation patch
 also modifies the copied `resources/codex.exe`, invalidating that copy's
 vendor signature.
 
@@ -141,11 +141,11 @@ Fast also recognizes this state: the UI accepts `authMethod == null` only when `
 
 ### Built-in Image Generation
 
-Windows app `26.1021.31345` bundles Codex CLI `0.164.0-alpha.11.1`, whose native app-server has two additional authentication gates around the image extension. The complete workflow patches both gates in `resources/codex.exe` with unique, version-specific machine-code signatures. It validates every original or already-patched signature before writing, prepares the result in a temporary copy, and atomically replaces the executable. Traditional installs retain `codex.exe.imagegen.bak`; Store installs already keep the official package unchanged.
+Windows app `26.1021.31345` bundles Codex CLI `0.164.0-alpha.11.1`, and app `26.1023.51421` bundles CLI `0.165.0-alpha.1.2`. Their native app-server has two additional authentication gates around the image extension. The complete workflow selects one coherent, version-specific signature set, patches both gates in `resources/codex.exe`, and rejects missing, duplicate, or mixed signatures. It validates every original or already-patched signature before writing, prepares the result in a temporary copy, and atomically replaces the executable. Traditional installs retain `codex.exe.imagegen.bak`; Store installs already keep the official package unchanged.
 
 The patch does not invent image support. It retains the `[features] image_generation = true` flag, Free-plan exclusion, provider capability, and model image-input checks. In this version, Responses-compatible custom providers default to the image-generation capability, but they must still implement compatible `/images/generations` and `/images/edits` endpoints. See the [official OpenAI image-generation guide](https://developers.openai.com/api/docs/guides/image-generation).
 
-This native patch is currently verified only for Windows `26.1021`; macOS is left unchanged. A version drift, missing signature, or duplicate signature fails closed before ASAR repackaging.
+This native patch is currently verified for Windows `26.1021` and `26.1023`; macOS is left unchanged. A version drift, missing signature, duplicate signature, or mixed signature set fails closed before ASAR repackaging.
 
 ## Version Updates
 
@@ -160,5 +160,7 @@ Windows Store `26.1021.3705.0` (app `26.1021.31345`) also accepts Amazon Bedrock
 Validation on 2026-10-26 passed 42 tests. The complete Windows workflow applied 13 patches with no failures; a second inspection recognized all 13 as already applied. All four changed JavaScript files passed Node syntax checks and matched their packed ASAR entries. The executable's embedded header hash matched the rebuilt ASAR, and the original archive matched the backup. Extracted functions from the installed bundle passed 60 auth/server cases and a loading-state check using mocked backend responses. The patched processes started and remained responsive; no billable model request or response-speed measurement was performed.
 
 Validation on 2026-10-28 passed 43 tests. The complete Windows `26.1021.3705.0` workflow applied 15 patches with no failures, including both native image-generation gates; a second native inspection recognized both as already applied. The rebuilt ASAR header hash occurred exactly once in the copied `ChatGPT.exe`, the patched desktop process remained alive during a startup smoke test, and a local mock Responses endpoint captured exactly one non-billable request. Its 10-tool payload contained the `image_gen` namespace with the `imagegen` function. No `/images/*` request or external model request was sent.
+
+Validation on 2026-10-29 passed 43 tests. The complete Windows `26.1023.6621.0` workflow selected the `0.165.0-alpha.1.2` native signature set and applied all 15 patches with no failures. The rebuilt ASAR header hash was updated exactly once, the patched `codex.exe --version` command remained functional, both original native signatures were absent, both patched signatures occurred exactly once, and the desktop shortcut targeted the independent patched copy and user-data directory.
 
 For Nowledge MCP settings that disappear when a configuration manager rewrites Codex settings, see the [configuration persistence investigation](docs/nowledge-mcp-persistence.md). The application patch itself does not manage MCP credentials.

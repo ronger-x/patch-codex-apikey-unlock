@@ -1339,49 +1339,53 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
 
     def test_image_generation_binary_patch_is_atomic_idempotent_and_fails_closed(self):
         with loaded_patch_module() as patch_module, tempfile.TemporaryDirectory() as tmp:
-            exe = Path(tmp) / "codex.exe"
-            originals = [
-                original
-                for _, original, _ in patch_module._IMAGE_GENERATION_BINARY_PATCHES
-            ]
-            patched_patterns = [
-                patched
-                for _, _, patched in patch_module._IMAGE_GENERATION_BINARY_PATCHES
-            ]
-            original_image = b"MZprefix" + b"separator".join(originals) + b"suffix"
-            expected_image = original_image
-            for original, patched in zip(originals, patched_patterns):
-                expected_image = expected_image.replace(original, patched)
-            exe.write_bytes(original_image)
+            for index, (version, patches) in enumerate(
+                    patch_module._IMAGE_GENERATION_BINARY_PATCH_SETS):
+                with self.subTest(version=version):
+                    exe = Path(tmp) / f"codex-{index}.exe"
+                    originals = [original for _, original, _ in patches]
+                    patched_patterns = [patched for _, _, patched in patches]
+                    original_image = (
+                        b"MZprefix" + b"separator".join(originals) + b"suffix"
+                    )
+                    expected_image = original_image
+                    for original, patched in zip(originals, patched_patterns):
+                        expected_image = expected_image.replace(original, patched)
+                    exe.write_bytes(original_image)
 
-            patch_module.DRY_RUN = False
-            patch_module.results = {"applied": [], "skipped": [], "failed": []}
-            with contextlib.redirect_stdout(io.StringIO()):
-                self.assertTrue(
-                    patch_module.apply_image_generation_binary_patch(str(exe))
-                )
-            self.assertEqual(expected_image, exe.read_bytes())
-            self.assertEqual(
-                original_image, Path(str(exe) + ".imagegen.bak").read_bytes()
-            )
-            self.assertEqual(
-                len(patch_module._IMAGE_GENERATION_BINARY_PATCHES),
-                len(patch_module.results["applied"]),
-            )
-            self.assertEqual([], patch_module.results["failed"])
+                    patch_module.DRY_RUN = False
+                    patch_module.results = {
+                        "applied": [], "skipped": [], "failed": []
+                    }
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        self.assertTrue(
+                            patch_module.apply_image_generation_binary_patch(str(exe))
+                        )
+                    self.assertEqual(expected_image, exe.read_bytes())
+                    self.assertEqual(
+                        original_image,
+                        Path(str(exe) + ".imagegen.bak").read_bytes(),
+                    )
+                    self.assertEqual(
+                        len(patches), len(patch_module.results["applied"])
+                    )
+                    self.assertEqual([], patch_module.results["failed"])
 
-            patch_module.results = {"applied": [], "skipped": [], "failed": []}
-            with contextlib.redirect_stdout(io.StringIO()):
-                self.assertTrue(
-                    patch_module.apply_image_generation_binary_patch(str(exe))
-                )
-            self.assertEqual(expected_image, exe.read_bytes())
-            self.assertEqual(
-                len(patch_module._IMAGE_GENERATION_BINARY_PATCHES),
-                len(patch_module.results["skipped"]),
-            )
+                    patch_module.results = {
+                        "applied": [], "skipped": [], "failed": []
+                    }
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        self.assertTrue(
+                            patch_module.apply_image_generation_binary_patch(str(exe))
+                        )
+                    self.assertEqual(expected_image, exe.read_bytes())
+                    self.assertEqual(
+                        len(patches), len(patch_module.results["skipped"])
+                    )
 
             ambiguous = Path(tmp) / "ambiguous.exe"
+            _, first_patches = patch_module._IMAGE_GENERATION_BINARY_PATCH_SETS[0]
+            originals = [original for _, original, _ in first_patches]
             ambiguous_image = (
                 b"MZprefix" + originals[0] + b"duplicate" + originals[0]
                 + b"separator" + b"separator".join(originals[1:]) + b"suffix"
@@ -1396,7 +1400,30 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
             self.assertFalse(Path(str(ambiguous) + ".imagegen.bak").exists())
             self.assertEqual(1, len(patch_module.results["failed"]))
 
+            mixed = Path(tmp) / "mixed.exe"
+            _, latest_patches = patch_module._IMAGE_GENERATION_BINARY_PATCH_SETS[-1]
+            mixed_image = (
+                b"MZprefix" + originals[0] + b"separator"
+                + first_patches[1][1] + b"mixed" + latest_patches[1][1]
+                + b"suffix"
+            )
+            mixed.write_bytes(mixed_image)
+            patch_module.results = {"applied": [], "skipped": [], "failed": []}
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertFalse(
+                    patch_module.apply_image_generation_binary_patch(str(mixed))
+                )
+            self.assertEqual(mixed_image, mixed.read_bytes())
+            self.assertFalse(Path(str(mixed) + ".imagegen.bak").exists())
+            self.assertEqual(1, len(patch_module.results["failed"]))
+
             store_copy = Path(tmp) / "store-codex.exe"
+            originals = [original for _, original, _ in latest_patches]
+            patched_patterns = [patched for _, _, patched in latest_patches]
+            original_image = b"MZprefix" + b"separator".join(originals) + b"suffix"
+            expected_image = original_image
+            for original, patched in zip(originals, patched_patterns):
+                expected_image = expected_image.replace(original, patched)
             store_copy.write_bytes(original_image)
             patch_module.results = {"applied": [], "skipped": [], "failed": []}
             with contextlib.redirect_stdout(io.StringIO()):
