@@ -479,6 +479,11 @@ def _find(base, pattern):
     return glob.glob(os.path.join(base, pattern))
 
 
+def _find_recursive(base, pattern):
+    """Find generated Rspack chunks below a directory recursively."""
+    return glob.glob(os.path.join(base, "**", pattern), recursive=True)
+
+
 def apply_patch(fp, name, find_str, replace_str, regex=None, replace_fn=None, skip_regex=None):
     with open(fp, encoding="utf-8") as f:
         content = f.read()
@@ -568,7 +573,7 @@ def _service_tier_gate_candidates(assets, require_semantic_marker=False):
     original, patched = _service_tier_gate_patterns()
     candidates = []
     weak_candidates = []
-    for fp in sorted(glob.glob(os.path.join(assets, "*.js"))):
+    for fp in sorted(_find(assets, "*.js")):
         with open(fp, encoding="utf-8") as fh:
             content = fh.read()
         # Large generated assets may contain megabytes of base64 or embedded
@@ -696,7 +701,7 @@ def apply_saved_service_tier_auth_patch(assets):
     name = "Saved service tier request auth"
     identifier = r'[a-zA-Z_$][a-zA-Z0-9_$]*'
     candidates = []
-    for fp in sorted(glob.glob(os.path.join(assets, "*.js"))):
+    for fp in sorted(_find(assets, "*.js")):
         with open(fp, encoding="utf-8") as fh:
             content = fh.read()
         if "readServiceTier(" not in content:
@@ -1033,26 +1038,40 @@ def apply_windows_app_user_model_id_patch(main_build):
     enum_reference = rf'{identifier}(?:\.{identifier})*'
     original = re.compile(
         rf'case[ \t]+(?P<flavor>{enum_reference})\.Prod[ \t]*:[ \t]*'
-        r'return[ \t]*`com\.openai\.codex`'
+        r'return[ \t]*(?P<quote>["\'`])com\.openai\.codex(?P=quote)'
     )
     patched = re.compile(
         rf'case[ \t]+{enum_reference}\.Prod[ \t]*:[ \t]*'
-        r'return[ \t]*`com\.openai\.codex\.patched`'
+        r'return[ \t]*["\'`]com\.openai\.codex\.patched["\'`]'
     )
     candidates = []
     feature_present = False
-    for fp in _find(main_build, "*.js"):
+    files = _find(main_build, "*.js")
+    contents = {}
+    has_identity_call = False
+    for fp in files:
         with open(fp, encoding="utf-8") as fh:
             content = fh.read()
+        contents[fp] = content
+        has_identity_call = has_identity_call or "setAppUserModelId" in content
+
+    for fp, content in contents.items():
         # 26.930 inlines the identity helper in bootstrap and also copies a
-        # similarly shaped log-directory helper into worker.js. Only follow
-        # chunks with the actual Electron identity call or the legacy module.
-        if (not os.path.basename(fp).startswith("file-based-logger-") and
+        # similarly shaped log-directory helper into worker.js. In 26.1029
+        # Rspack splits the call and helper between early-bootstrap chunks, so
+        # include the shared early-bootstrap.js helper while still excluding
+        # worker.js and unrelated numbered chunks.
+        basename = os.path.basename(fp)
+        is_legacy_identity_module = basename.startswith("file-based-logger-")
+        if (not is_legacy_identity_module and
+                basename != "early-bootstrap.js" and
                 "setAppUserModelId" not in content):
             continue
         feature_present = (
             feature_present
-            or (".Prod" in content and "com.openai.codex" in content)
+            or ((is_legacy_identity_module or has_identity_call)
+                and ".Prod" in content and
+                "com.openai.codex" in content)
         )
         if original.search(content) or patched.search(content):
             candidates.append(fp)
@@ -1072,7 +1091,8 @@ def apply_windows_app_user_model_id_patch(main_build):
         original.pattern,
         lambda match: (
             f"case {match.group('flavor')}.Prod:"
-            "return`com.openai.codex.patched`"
+            f"return{match.group('quote')}com.openai.codex.patched"
+            f"{match.group('quote')}"
         ),
         skip_regex=patched.pattern,
     )
@@ -1200,7 +1220,7 @@ def _native_apikey_plugins_file(assets):
         r'(?=[ \t]*(?:&&|\)|;|\}))'
     )
     candidates = _find(assets, "use-plugins-*.js")
-    candidates.extend(glob.glob(os.path.join(assets, "*.js")))
+    candidates.extend(_find(assets, "*.js"))
     for fp in sorted(set(candidates)):
         with open(fp, encoding="utf-8") as fh:
             if pattern.search(fh.read()):
@@ -1431,7 +1451,7 @@ def _patch_dictation_capability_gate(assets):
         rf'(?P=status)'
     )
     candidates = []
-    for fp in glob.glob(os.path.join(assets, "*.js")):
+    for fp in _find(assets, "*.js"):
         with open(fp, encoding="utf-8") as fh:
             content = fh.read()
         if "reason:`unsupported-auth`" not in content:
@@ -1481,7 +1501,7 @@ def _patch_usage_settings_capability_gate(assets):
         rf'(?P<fields>[^}}]*)\}}[ \t]*\)[ \t]*\{{'
     )
     candidates = []
-    for fp in glob.glob(os.path.join(assets, "*.js")):
+    for fp in _find(assets, "*.js"):
         with open(fp, encoding="utf-8") as fh:
             content = fh.read()
         for signature in signature_pattern.finditer(content):
@@ -1768,10 +1788,923 @@ def apply_reasoning_effort_filter_patch(fp, validate_only=False):
     return True
 
 
+def _rspack_asset_contents(assets):
+    """Return semantically relevant numbered Rspack chunks, or None.
+
+    The 26.1029 renderer contains roughly nine thousand JavaScript chunks.
+    Reading that tree once and retaining only strong-marker matches keeps the
+    adaptation deterministic without repeating hundreds of megabytes of I/O
+    for every feature module.
+    """
+    async_dir = os.path.join(assets, "async")
+    if not os.path.isdir(async_dir):
+        return None
+    files = sorted(_find_recursive(async_dir, "*.js"))
+    if not any(re.fullmatch(r"[0-9]+\.[0-9a-f]+\.js", os.path.basename(fp))
+               for fp in files):
+        return None
+    markers = (
+        "serviceTierAccess",
+        "Failed to read service tier for request",
+        "readServiceTier(",
+        "apiKeyDaybreakSupported",
+        "hasModelSupportingUltraReasoningEffort",
+        "enable_i18n",
+        'featureName:"browser_use"',
+        'featureName:"browser_use_external"',
+        'featureName:"computer_use"',
+        'reason:"unsupported-auth"',
+        "isUsageSettingsVisible",
+        'productContext:"catalog"',
+        "hiddenPluginIds",
+    )
+    contents = {}
+    for fp in files:
+        with open(fp, encoding="utf-8") as fh:
+            content = fh.read()
+        if any(marker in content for marker in markers):
+            contents[fp] = content
+    if not any("Failed to read service tier for request" in content
+               for content in contents.values()):
+        return None
+    return contents
+
+
+def _store_rspack_content(contents, fp, content):
+    contents[fp] = content
+    if not DRY_RUN:
+        with open(fp, "w", encoding="utf-8") as fh:
+            fh.write(content)
+
+
+def _record_rspack_applied(fp, name):
+    results["applied"].append(f"{os.path.basename(fp)}: {name}")
+    print(f"    [OK]   {name}")
+
+
+def _record_rspack_skipped(fp, name):
+    results["skipped"].append(f"{os.path.basename(fp)}: {name}")
+    print(f"    [SKIP] {name}")
+
+
+def _patch_rspack_fast_ui(contents):
+    """Patch every emitted copy of the 26.1029 service-tier hook."""
+    name = "Service tier authorization gate"
+    identifier = r'[a-zA-Z_$][a-zA-Z0-9_$]*'
+    original = re.compile(
+        rf'(?P<flag>{identifier})=(?P<account>{identifier})'
+        rf'\?\.authMethod==="chatgpt"'
+        rf'(?P<allow>(?:\|\|(?P=account)\?\.authMethod==="'
+        rf'(?:personalAccessToken|amazonBedrock)")*),'
+        rf'(?P<method>{identifier})=(?P=account)\?\.authMethod\?\?null'
+    )
+    patched = re.compile(
+        rf'(?P<flag>{identifier})=(?P<account>{identifier})'
+        rf'\?\.authMethod==="apikey"\|\|'
+        rf'(?P=account)\?\.authMethod==="chatgpt"'
+        rf'(?P<allow>(?:\|\|(?P=account)\?\.authMethod==="'
+        rf'(?:personalAccessToken|amazonBedrock)")*)\|\|'
+        rf'(?P=account)\?\.authMethod==null&&'
+        rf'(?P=account)\?\.requiresAuth===!1,'
+        rf'(?P<method>{identifier})=(?P=account)\?\.authMethod\?\?null'
+    )
+    definition_files = [
+        fp for fp, content in contents.items()
+        if ("serviceTierAccess" in content and
+            re.search(r'(?:^|[,{}])ipV4\([^)]*\)\{', content))
+    ]
+    if not definition_files:
+        mark_missing(name, "Target file not found")
+        return False
+    targets = []
+    for fp in definition_files:
+        content = contents[fp]
+        original_matches = list(original.finditer(content))
+        patched_matches = list(patched.finditer(content))
+        if len(original_matches) + len(patched_matches) != 1:
+            mark_missing(
+                f"{os.path.basename(fp)}: {name}",
+                "Target structure mismatch",
+            )
+            return False
+        targets.append((fp, original_matches, patched_matches))
+    for fp, original_matches, patched_matches in targets:
+        if patched_matches:
+            _record_rspack_skipped(fp, name)
+            continue
+        content = contents[fp]
+        match = original_matches[0]
+        account = match.group("account")
+        replacement = (
+            f'{match.group("flag")}={account}?.authMethod==="apikey"||'
+            f'{account}?.authMethod==="chatgpt"'
+            f'{match.group("allow") or ""}||'
+            f'{account}?.authMethod==null&&{account}?.requiresAuth===!1,'
+            f'{match.group("method")}={account}?.authMethod??null'
+        )
+        content = content[:match.start()] + replacement + content[match.end():]
+        _store_rspack_content(contents, fp, content)
+        _record_rspack_applied(fp, name)
+    return True
+
+
+def _rspack_fast_request_file(contents):
+    files = [
+        fp for fp, content in contents.items()
+        if "Failed to read service tier for request" in content
+    ]
+    return _single_patch_target(
+        files, "Fast request service tier gate", required=True
+    )
+
+
+def _patch_rspack_fast_request_gate(contents, fp):
+    name = "Fast request service tier gate"
+    identifier = r'[a-zA-Z_$][a-zA-Z0-9_$]*'
+    original = re.compile(
+        rf'if\("chatgpt"!==(?P<method>{identifier})'
+        rf'(?P<allow>(?:&&"(?:personalAccessToken|amazonBedrock)"'
+        rf'!==(?:\1))*)\)return[ \t]*(?P<denied>!1|null);'
+    )
+    patched = re.compile(
+        rf'if\("chatgpt"!==(?P<method>{identifier})&&"apikey"'
+        rf'!==(?:\1)(?P<allow>(?:&&"(?:personalAccessToken|amazonBedrock)"'
+        rf'!==(?:\1))*)\)return[ \t]*(?P<denied>!1|null);'
+    )
+    content = contents[fp]
+    original_matches = list(original.finditer(content))
+    patched_matches = list(patched.finditer(content))
+    if len(original_matches) + len(patched_matches) != 1:
+        mark_missing(
+            f"{os.path.basename(fp)}: {name}", "Target structure mismatch"
+        )
+        return False
+    if patched_matches:
+        _record_rspack_skipped(fp, name)
+        return True
+    match = original_matches[0]
+    method = match.group("method")
+    replacement = (
+        f'if("chatgpt"!=={method}&&"apikey"!=={method}'
+        f'{match.group("allow")})return {match.group("denied")};'
+    )
+    content = content[:match.start()] + replacement + content[match.end():]
+    _store_rspack_content(contents, fp, content)
+    _record_rspack_applied(fp, name)
+    return True
+
+
+def _patch_rspack_fast_custom_provider(contents, fp):
+    """Opt only the Fast caller into the shared no-login provider resolver."""
+    name = "Fast custom-provider request auth"
+    identifier = r'[a-zA-Z_$][a-zA-Z0-9_$]*'
+    content = contents[fp]
+
+    resolver_candidates = []
+    signature_pattern = re.compile(
+        rf'async function (?P<name>{identifier})\('
+        rf'(?P<scope>{identifier}),(?P<host>{identifier})'
+        rf'(?:,(?P<allow>{identifier})=!1)?\)\{{'
+    )
+    for signature in signature_pattern.finditer(content):
+        end = _js_block_end(content, signature.end() - 1)
+        if end is None:
+            continue
+        body = content[signature.end():end]
+        if ('.rpc.getAccount({priority:"critical"})' in body and
+                '.rpc.getAuthMethod({priority:"critical"})' in body and
+                '"apiKey"===' in body and '?"apikey":' in body):
+            resolver_candidates.append((signature, end, body))
+    if len(resolver_candidates) != 1:
+        mark_missing(
+            f"{os.path.basename(fp)}: {name}",
+            "Ambiguous service-tier account resolver",
+        )
+        return False
+    signature, _, body = resolver_candidates[0]
+    allow = signature.group("allow")
+    original_null = re.compile(
+        rf'var (?P<account>{identifier})=(?P<response>{identifier})\.account;'
+        rf'if\(null==(?P=account)\)return null;'
+    )
+    original_null_matches = list(original_null.finditer(body))
+    if allow is None:
+        patched_null_matches = []
+    else:
+        patched_null = re.compile(
+            rf'var (?P<account>{identifier})=(?P<response>{identifier})\.account;'
+            rf'if\(null==(?P=account)\)return {re.escape(allow)}&&'
+            rf'(?P=response)\.requiresOpenaiAuth===!1\?"apikey":null;'
+        )
+        patched_null_matches = list(patched_null.finditer(body))
+
+    caller = re.compile(
+        rf'let (?P<method>{identifier})=await '
+        rf'(?P<callee>\(0,{identifier}\.{identifier}\))\('
+        rf'(?P<scope>{identifier}),(?P<host>{identifier})'
+        rf'(?P<enabled>,!0)?\);if\("chatgpt"!==(?P=method)'
+    )
+    caller_matches = list(caller.finditer(content))
+    if len(caller_matches) != 1:
+        mark_missing(
+            f"{os.path.basename(fp)}: {name}", "Target structure mismatch"
+        )
+        return False
+    caller_match = caller_matches[0]
+
+    resolver_complete = (
+        allow is not None and len(patched_null_matches) == 1
+        and not original_null_matches
+    )
+    resolver_original = (
+        allow is None and len(original_null_matches) == 1
+        and not patched_null_matches
+    )
+    if not resolver_complete and not resolver_original:
+        mark_missing(
+            f"{os.path.basename(fp)}: {name}",
+            "Incomplete custom-provider resolver patch",
+        )
+        return False
+
+    caller_complete = caller_match.group("enabled") is not None
+    if resolver_complete and caller_complete:
+        _record_rspack_skipped(fp, name)
+        return True
+
+    edits = []
+    if resolver_original:
+        used_identifiers = set(re.findall(identifier, body))
+        allow = "__codexAllowCustomProvider"
+        suffix = 2
+        while allow in used_identifiers:
+            allow = f"__codexAllowCustomProvider{suffix}"
+            suffix += 1
+        insert_at = signature.end() - 2
+        edits.append((insert_at, insert_at, f",{allow}=!1"))
+        null_match = original_null_matches[0]
+        response = null_match.group("response")
+        account = null_match.group("account")
+        replacement = (
+            f"var {account}={response}.account;if(null=={account})return "
+            f'{allow}&&{response}.requiresOpenaiAuth===!1?"apikey":null;'
+        )
+        body_start = signature.end()
+        edits.append((
+            body_start + null_match.start(),
+            body_start + null_match.end(),
+            replacement,
+        ))
+    if not caller_complete:
+        insert_at = caller_match.start("enabled")
+        # An unmatched optional group has start() == -1; insert before the
+        # closing parenthesis immediately following the host argument.
+        if insert_at < 0:
+            insert_at = caller_match.start() + caller_match.group(0).index(
+                ");if("
+            )
+        edits.append((insert_at, insert_at, ",!0"))
+
+    for start, end, replacement in sorted(edits, reverse=True):
+        content = content[:start] + replacement + content[end:]
+    _store_rspack_content(contents, fp, content)
+    _record_rspack_applied(fp, name)
+    return True
+
+
+def _patch_rspack_saved_service_tier(contents):
+    name = "Saved service tier request auth"
+    identifier = r'[a-zA-Z_$][a-zA-Z0-9_$]*'
+    candidates = []
+    for fp, content in contents.items():
+        if "readServiceTier(" not in content:
+            continue
+        for signature in re.finditer(
+                rf'async readServiceTier\({identifier}\)\{{', content):
+            end = _js_block_end(content, signature.end() - 1)
+            if end is None:
+                continue
+            body = content[signature.end():end]
+            if "isUsingCopilotInference" in body and ".getAccount(" in body:
+                candidates.append((fp, signature.end(), end))
+    if len(candidates) != 1:
+        mark_missing(name, "Target structure mismatch")
+        return False
+    fp, start, end = candidates[0]
+    content = contents[fp]
+    body = content[start:end]
+    original = re.compile(
+        rf'return (?P<response>{identifier})\.account\?\.type==="chatgpt"'
+        rf'\|\|(?P=response)\.account\?\.type==="amazonBedrock"'
+        rf'(?=\}})'
+    )
+    patched = re.compile(
+        rf'return (?P<response>{identifier})\.account\?\.type==="chatgpt"'
+        rf'\|\|(?P=response)\.account\?\.type==="amazonBedrock"'
+        rf'\|\|(?P=response)\.account\?\.type==="apiKey"\|\|'
+        rf'(?P=response)\.account==null&&'
+        rf'(?P=response)\.requiresOpenaiAuth===!1(?=\}})'
+    )
+    original_matches = list(original.finditer(body))
+    patched_matches = list(patched.finditer(body))
+    if len(original_matches) + len(patched_matches) != 1:
+        mark_missing(
+            f"{os.path.basename(fp)}: {name}", "Target structure mismatch"
+        )
+        return False
+    if patched_matches:
+        _record_rspack_skipped(fp, name)
+        return True
+    match = original_matches[0]
+    response = match.group("response")
+    replacement = (
+        f'{match.group(0)}||{response}.account?.type==="apiKey"||'
+        f'{response}.account==null&&{response}.requiresOpenaiAuth===!1'
+    )
+    absolute_start = start + match.start()
+    absolute_end = start + match.end()
+    content = (
+        content[:absolute_start] + replacement + content[absolute_end:]
+    )
+    _store_rspack_content(contents, fp, content)
+    _record_rspack_applied(fp, name)
+    return True
+
+
+def _destructured_field_alias(fields, field):
+    identifier = r'[a-zA-Z_$][a-zA-Z0-9_$]*'
+    match = re.search(
+        rf'(?:^|,){re.escape(field)}'
+        rf'(?::(?P<alias>{identifier}))?'
+        rf'(?:=[^,]*)?(?=,|$)',
+        fields,
+    )
+    if match is None:
+        return None
+    return match.group("alias") or field
+
+
+def _patch_rspack_models_and_reasoning(contents):
+    model_name = "Hidden model list unlock"
+    reasoning_name = "Reasoning effort list unlock"
+    identifier = r'[a-zA-Z_$][a-zA-Z0-9_$]*'
+    signature_pattern = re.compile(
+        rf'function (?P<function>{identifier})\(\{{(?P<fields>[^}}]*)\}}\)\{{'
+    )
+    candidates = []
+    required = (
+        "authMethod",
+        "enabledReasoningEfforts",
+        "includeUltraReasoningEffort",
+        "isCustomModelProvider",
+        "models",
+        "useHiddenModels",
+    )
+    for fp, content in contents.items():
+        if ("apiKeyDaybreakSupported" not in content or
+                "hasModelSupportingUltraReasoningEffort" not in content):
+            continue
+        for signature in signature_pattern.finditer(content):
+            aliases = {
+                field: _destructured_field_alias(
+                    signature.group("fields"), field
+                )
+                for field in required
+            }
+            if not all(aliases.values()):
+                continue
+            end = _js_block_end(content, signature.end() - 1)
+            if end is None:
+                continue
+            scope = content[signature.end():end]
+            if ("hasModelSupportingUltraReasoningEffort" in scope and
+                    "codex-auto-review" in scope and
+                    ".supportedReasoningEfforts" in scope):
+                candidates.append((fp, signature, end, aliases))
+    if len(candidates) != 1:
+        mark_missing(model_name, "Target structure mismatch")
+        return False
+
+    fp, signature, scope_end, aliases = candidates[0]
+    content = contents[fp]
+    scope_start = signature.end()
+    scope = content[scope_start:scope_end]
+    auth = aliases["authMethod"]
+    enabled = aliases["enabledReasoningEfforts"]
+    ultra_gate = aliases["includeUltraReasoningEffort"]
+    custom_provider = aliases["isCustomModelProvider"]
+    models = aliases["models"]
+    unlock = f'"apikey"==={auth}||null=={auth}&&{custom_provider}'
+
+    anonymous_pattern = re.compile(r'function\(\{(?P<fields>[^}]*)\}\)\{')
+    visibility_candidates = []
+    for nested in anonymous_pattern.finditer(scope):
+        nested_auth = _destructured_field_alias(
+            nested.group("fields"), "authMethod"
+        )
+        nested_model = _destructured_field_alias(
+            nested.group("fields"), "model"
+        )
+        if nested_auth is None or nested_model is None:
+            continue
+        nested_end = _js_block_end(scope, nested.end() - 1)
+        if nested_end is None:
+            continue
+        nested_body = scope[nested.end():nested_end]
+        guard = f'"codex-auto-review"!=={nested_model}.model&&('
+        original_marker = guard
+        patched_marker = guard + f'"apikey"==={nested_auth}||'
+        if patched_marker in nested_body:
+            visibility_candidates.append((nested, nested_auth, guard, True))
+        elif original_marker in nested_body:
+            visibility_candidates.append((nested, nested_auth, guard, False))
+    if len(visibility_candidates) != 1:
+        mark_missing(
+            f"{os.path.basename(fp)}: {model_name}",
+            "Target structure mismatch",
+        )
+        return False
+    nested, nested_auth, visibility_guard, visibility_complete = (
+        visibility_candidates[0]
+    )
+    if nested_auth != auth:
+        mark_missing(
+            f"{os.path.basename(fp)}: {model_name}",
+            "Authentication alias mismatch",
+        )
+        return False
+
+    ultra_original = re.compile(
+        rf'(?P<target>{identifier})={re.escape(ultra_gate)}\?'
+        rf'(?P<model>{identifier})\.supportedReasoningEfforts:'
+        rf'(?P=model)\.supportedReasoningEfforts\.filter\(\(\{{'
+        rf'reasoningEffort:(?P<effort>{identifier})\}}\)=>'
+        rf'"ultra"!==(?P=effort)\)'
+    )
+    ultra_patched = re.compile(
+        rf'(?P<target>{identifier})=\({re.escape(unlock)}\|\|'
+        rf'{re.escape(ultra_gate)}\)\?(?P<model>{identifier})\.'
+        rf'supportedReasoningEfforts:(?P=model)\.supportedReasoningEfforts\.'
+        rf'filter\(\(\{{reasoningEffort:(?P<effort>{identifier})\}}\)=>'
+        rf'"ultra"!==(?P=effort)\)'
+    )
+    validator = rf'\(0,{identifier}\.{identifier}\)'
+    enabled_original = re.compile(
+        rf'(?P<prefix>\("copilot"==={re.escape(auth)}\?\[.*?\]:'
+        rf'(?P<efforts>{identifier})\))\.filter\(\(\{{'
+        rf'reasoningEffort:(?P<effort>{identifier})\}}\)=>'
+        rf'(?P<validator>{validator})\((?P=effort)\)&&'
+        rf'{re.escape(enabled)}\.has\((?P=effort)\)\)'
+    )
+    enabled_patched = re.compile(
+        rf'(?P<prefix>\("copilot"==={re.escape(auth)}\?\[.*?\]:'
+        rf'(?P<efforts>{identifier})\))\.filter\(\(\{{'
+        rf'reasoningEffort:(?P<effort>{identifier})\}}\)=>'
+        rf'(?P<validator>{validator})\((?P=effort)\)&&\('
+        rf'{re.escape(unlock)}\|\|{re.escape(enabled)}\.'
+        rf'has\((?P=effort)\)\)\)'
+    )
+    summary_original = re.compile(
+        rf'(?P<summary>{identifier})={re.escape(ultra_gate)}&&'
+        rf'{re.escape(models)}\.some\((?P<model>{identifier})=>'
+        rf'(?P=model)\.supportedReasoningEfforts\.some\(\(\{{'
+        rf'reasoningEffort:(?P<effort>{identifier})\}}\)=>'
+        rf'"ultra"===(?P=effort)\)\)'
+    )
+    summary_patched = re.compile(
+        rf'(?P<summary>{identifier})=\({re.escape(unlock)}\|\|'
+        rf'{re.escape(ultra_gate)}\)&&{re.escape(models)}\.some\('
+        rf'(?P<model>{identifier})=>'
+        rf'(?P=model)\.supportedReasoningEfforts\.some\(\(\{{'
+        rf'reasoningEffort:(?P<effort>{identifier})\}}\)=>'
+        rf'"ultra"===(?P=effort)\)\)'
+    )
+
+    pattern_states = []
+    for original, patched in (
+            (ultra_original, ultra_patched),
+            (enabled_original, enabled_patched),
+            (summary_original, summary_patched)):
+        original_matches = list(original.finditer(scope))
+        patched_matches = list(patched.finditer(scope))
+        if len(original_matches) + len(patched_matches) != 1:
+            mark_missing(
+                f"{os.path.basename(fp)}: {reasoning_name}",
+                "Target structure mismatch",
+            )
+            return False
+        pattern_states.append((original_matches, patched_matches))
+
+    edits = []
+    if not visibility_complete:
+        nested_body_start = nested.end()
+        marker_at = scope.index(visibility_guard, nested_body_start)
+        insert_at = marker_at + len(visibility_guard)
+        edits.append((insert_at, insert_at, f'"apikey"==={auth}||'))
+
+    ultra_original_matches, ultra_patched_matches = pattern_states[0]
+    if ultra_original_matches:
+        match = ultra_original_matches[0]
+        replacement = (
+            f'{match.group("target")}=({unlock}||{ultra_gate})?'
+            f'{match.group("model")}.supportedReasoningEfforts:'
+            f'{match.group("model")}.supportedReasoningEfforts.filter('
+            f'({{reasoningEffort:{match.group("effort")}}})=>'
+            f'"ultra"!=={match.group("effort")})'
+        )
+        edits.append((match.start(), match.end(), replacement))
+
+    enabled_original_matches, enabled_patched_matches = pattern_states[1]
+    if enabled_original_matches:
+        match = enabled_original_matches[0]
+        used_identifiers = set(re.findall(identifier, scope))
+        effort = "__codexReasoningEffort"
+        suffix = 2
+        while effort in used_identifiers:
+            effort = f"__codexReasoningEffort{suffix}"
+            suffix += 1
+        replacement = (
+            f'{match.group("prefix")}.filter('
+            f'({{reasoningEffort:{effort}}})=>'
+            f'{match.group("validator")}({effort})&&('
+            f'{unlock}||{enabled}.has({effort})))'
+        )
+        edits.append((match.start(), match.end(), replacement))
+
+    summary_original_matches, summary_patched_matches = pattern_states[2]
+    if summary_original_matches:
+        match = summary_original_matches[0]
+        replacement = (
+            f'{match.group("summary")}=({unlock}||{ultra_gate})&&'
+            f'{models}.some({match.group("model")}=>'
+            f'{match.group("model")}.supportedReasoningEfforts.some('
+            f'({{reasoningEffort:{match.group("effort")}}})=>'
+            f'"ultra"==={match.group("effort")}))'
+        )
+        edits.append((match.start(), match.end(), replacement))
+
+    patched_scope = scope
+    for start, end, replacement in sorted(edits, reverse=True):
+        patched_scope = patched_scope[:start] + replacement + patched_scope[end:]
+
+    if not visibility_complete:
+        _record_rspack_applied(fp, model_name)
+    else:
+        _record_rspack_skipped(fp, model_name)
+    reasoning_complete = all(patched for _, patched in pattern_states)
+    if reasoning_complete:
+        _record_rspack_skipped(fp, reasoning_name)
+    else:
+        _record_rspack_applied(fp, reasoning_name)
+    _store_rspack_content(
+        contents,
+        fp,
+        content[:scope_start] + patched_scope + content[scope_end:],
+    )
+    return True
+
+
+def _patch_rspack_i18n(contents):
+    name = "Force-enable i18n"
+    identifier = r'[a-zA-Z_$][a-zA-Z0-9_$]*'
+    original = re.compile(
+        rf'(?P<flag>{identifier})=(?P<client>{identifier})'
+        rf'\?\.get\("enable_i18n",!1\)'
+    )
+    patched = re.compile(
+        rf'(?P<flag>{identifier})=!0\|\|(?P<client>{identifier})'
+        rf'\?\.get\("enable_i18n",!1\)'
+    )
+    candidates = []
+    for fp, content in contents.items():
+        if "enable_i18n" not in content:
+            continue
+        original_matches = list(original.finditer(content))
+        patched_matches = list(patched.finditer(content))
+        if original_matches or patched_matches:
+            candidates.append((fp, original_matches, patched_matches))
+    if len(candidates) != 1:
+        mark_missing(name, "Target structure mismatch")
+        return False
+    fp, original_matches, patched_matches = candidates[0]
+    if len(original_matches) + len(patched_matches) != 1:
+        mark_missing(
+            f"{os.path.basename(fp)}: {name}", "Target structure mismatch"
+        )
+        return False
+    if patched_matches:
+        _record_rspack_skipped(fp, name)
+        return True
+    match = original_matches[0]
+    replacement = (
+        f'{match.group("flag")}=!0||{match.group("client")}'
+        '?.get("enable_i18n",!1)'
+    )
+    content = contents[fp]
+    content = content[:match.start()] + replacement + content[match.end():]
+    _store_rspack_content(contents, fp, content)
+    _record_rspack_applied(fp, name)
+    return True
+
+
+def _patch_rspack_desktop_gates(contents):
+    identifier = r'[a-zA-Z_$][a-zA-Z0-9_$]*'
+    gates = (
+        ("computer_use", "isComputerUseGateEnabled", "Computer Use availability"),
+        ("browser_use_external", "isExternalBrowserUseGateEnabled",
+         "External Browser availability"),
+        ("browser_use", "isBrowserAgentGateEnabled",
+         "Built-in Browser availability"),
+    )
+    validated = []
+    for feature_name, availability_field, patch_name in gates:
+        feature_marker = f'featureName:"{feature_name}"'
+        feature_candidates = []
+        for fp, content in contents.items():
+            if feature_marker not in content:
+                continue
+            for signature in re.finditer(
+                    rf'function (?P<function>{identifier})\([^)]*\)\{{',
+                    content):
+                end = _js_block_end(content, signature.end() - 1)
+                if end is None:
+                    continue
+                body = content[signature.end():end]
+                if feature_marker not in body:
+                    continue
+                statsig = list(re.finditer(
+                    rf'(?P<gate>{identifier})=\(0,'
+                    rf'{identifier}\.{identifier}\)\("[0-9]+"\)',
+                    body,
+                ))
+                auth = list(re.finditer(
+                    rf'(?P<method>{identifier})=(?P<state>{identifier})'
+                    rf'\?\.authMethod\?\?null;',
+                    body,
+                ))
+                if len(statsig) != 1 or len(auth) != 1:
+                    continue
+                gate = statsig[0].group("gate")
+                if not re.search(
+                        rf'{re.escape(availability_field)}:'
+                        rf'{re.escape(gate)}(?=[,}}])',
+                        body[auth[0].end():]):
+                    continue
+                feature_candidates.append((
+                    fp, signature.end(), end, body,
+                    statsig[0], auth[0],
+                ))
+        if len(feature_candidates) != 1:
+            mark_missing(patch_name, "Target structure mismatch")
+            return False
+        fp, start, end, body, statsig_match, auth_match = feature_candidates[0]
+        gate = statsig_match.group("gate")
+        method = auth_match.group("method")
+        statement = f'{gate}={gate}||{method}==="apikey";'
+        already = body.startswith(statement, auth_match.end())
+        validated.append((
+            fp, start + auth_match.end(), statement, already, patch_name
+        ))
+
+    edits_by_file = {}
+    for fp, insert_at, statement, already, patch_name in validated:
+        if already:
+            _record_rspack_skipped(fp, patch_name)
+            continue
+        edits_by_file.setdefault(fp, []).append((insert_at, insert_at, statement))
+        _record_rspack_applied(fp, patch_name)
+    for fp, edits in edits_by_file.items():
+        content = contents[fp]
+        for start, end, replacement in sorted(edits, reverse=True):
+            content = content[:start] + replacement + content[end:]
+        _store_rspack_content(contents, fp, content)
+    return True
+
+
+def _patch_rspack_dictation(contents):
+    name = "Dictation unlock"
+    identifier = r'[a-zA-Z_$][a-zA-Z0-9_$]*'
+    original = re.compile(
+        rf'"chatgpt"!==(?P<auth>{identifier})\.authMethod&&'
+        rf'"allowed"===(?P<status>{identifier})\.status\?'
+        rf'\{{status:"denied",reason:"unsupported-auth"\}}:'
+        rf'(?P=status)'
+    )
+    patched = re.compile(
+        rf'"chatgpt"!==(?P<auth>{identifier})\.authMethod&&'
+        rf'"apikey"!==(?P=auth)\.authMethod&&'
+        rf'"allowed"===(?P<status>{identifier})\.status\?'
+        rf'\{{status:"denied",reason:"unsupported-auth"\}}:'
+        rf'(?P=status)'
+    )
+    candidates = []
+    for fp, content in contents.items():
+        if 'reason:"unsupported-auth"' not in content:
+            continue
+        original_matches = list(original.finditer(content))
+        patched_matches = list(patched.finditer(content))
+        if original_matches or patched_matches:
+            candidates.append((fp, original_matches, patched_matches))
+    if len(candidates) != 1:
+        mark_missing(name, "Target structure mismatch")
+        return False
+    fp, original_matches, patched_matches = candidates[0]
+    if len(original_matches) + len(patched_matches) != 1:
+        mark_missing(
+            f"{os.path.basename(fp)}: {name}", "Target structure mismatch"
+        )
+        return False
+    if patched_matches:
+        _record_rspack_skipped(fp, name)
+        return True
+    match = original_matches[0]
+    replacement = (
+        f'"chatgpt"!=={match.group("auth")}.authMethod&&'
+        f'"apikey"!=={match.group("auth")}.authMethod&&'
+        f'"allowed"==={match.group("status")}.status?'
+        '{status:"denied",reason:"unsupported-auth"}:'
+        f'{match.group("status")}'
+    )
+    content = contents[fp]
+    content = content[:match.start()] + replacement + content[match.end():]
+    _store_rspack_content(contents, fp, content)
+    _record_rspack_applied(fp, name)
+    return True
+
+
+def _patch_rspack_usage_settings(contents):
+    name = "Usage settings unlock"
+    identifier = r'[a-zA-Z_$][a-zA-Z0-9_$]*'
+    signature_pattern = re.compile(r'function\(\{(?P<fields>[^}]*)\}\)\{')
+    original = re.compile(
+        rf'let (?P<flag>{identifier})="chatgpt"===(?P<auth>{identifier})'
+        rf'(?!\|\|"apikey"===)'
+    )
+    patched = re.compile(
+        rf'let (?P<flag>{identifier})="chatgpt"===(?P<auth>{identifier})'
+        rf'\|\|"apikey"===(?P=auth)'
+    )
+    targets = []
+    for fp, content in contents.items():
+        if "isUsageSettingsVisible" not in content:
+            continue
+        scoped = []
+        for signature in signature_pattern.finditer(content):
+            auth = _destructured_field_alias(
+                signature.group("fields"), "authMethod"
+            )
+            if auth is None:
+                continue
+            end = _js_block_end(content, signature.end() - 1)
+            if end is None:
+                continue
+            body = content[signature.end():end]
+            if ("isUsageSettingsVisible" not in body or
+                    "canManageCreditSettings" not in body or
+                    "canViewCreditSettings" not in body):
+                continue
+            original_matches = [
+                match for match in original.finditer(body)
+                if match.group("auth") == auth
+            ]
+            patched_matches = [
+                match for match in patched.finditer(body)
+                if match.group("auth") == auth
+            ]
+            if original_matches or patched_matches:
+                scoped.append((
+                    signature.end(), original_matches, patched_matches
+                ))
+        if len(scoped) != 1:
+            mark_missing(
+                f"{os.path.basename(fp)}: {name}",
+                "Target structure mismatch",
+            )
+            return False
+        start, original_matches, patched_matches = scoped[0]
+        if len(original_matches) + len(patched_matches) != 1:
+            mark_missing(
+                f"{os.path.basename(fp)}: {name}",
+                "Target structure mismatch",
+            )
+            return False
+        targets.append((fp, start, original_matches, patched_matches))
+    if not targets:
+        mark_missing(name, "Target file not found")
+        return False
+    pending = []
+    for fp, start, original_matches, patched_matches in targets:
+        if patched_matches:
+            pending.append((fp, None, None, None))
+            continue
+        match = original_matches[0]
+        replacement = (
+            f'let {match.group("flag")}="chatgpt"==={match.group("auth")}||'
+            f'"apikey"==={match.group("auth")}'
+        )
+        pending.append((
+            fp,
+            start + match.start(),
+            start + match.end(),
+            replacement,
+        ))
+    for fp, start, end, replacement in pending:
+        if replacement is None:
+            _record_rspack_skipped(fp, name)
+            continue
+        content = contents[fp]
+        content = content[:start] + replacement + content[end:]
+        _store_rspack_content(contents, fp, content)
+        _record_rspack_applied(fp, name)
+    return True
+
+
+def _rspack_native_plugin_support(contents):
+    identifier = r'[a-zA-Z_$][a-zA-Z0-9_$]*'
+    pattern = re.compile(
+        rf'\(\(0,{identifier}\.{identifier}\)\('
+        rf'(?P<state>{identifier})\?\.authMethod\?\?null\)\|\|'
+        rf'(?P=state)\?\.authMethod==="apikey"\)'
+    )
+    files = []
+    for fp, content in contents.items():
+        if ('productContext:"catalog"' not in content or
+                "hiddenPluginIds" not in content or
+                re.search(r'(?:^|[,{}])v5LP\([^)]*\)\{', content) is None):
+            continue
+        matches = list(pattern.finditer(content))
+        if len(matches) != 1:
+            mark_missing(
+                f"{os.path.basename(fp)}: Branding/plugin marketplace "
+                "compatibility",
+                "Native API-key directory structure mismatch",
+            )
+            return False
+        files.append(fp)
+    if not files:
+        mark_missing(
+            "Branding/plugin marketplace compatibility",
+            "Native API-key directory support not found",
+        )
+        return False
+    fp = sorted(files)[0]
+    mark_satisfied(
+        fp,
+        "Legacy plugin connector UI gate",
+        "Removed from current build",
+    )
+    mark_satisfied(
+        fp,
+        "Branding/plugin marketplace compatibility",
+        "Current build natively supports API keys",
+    )
+    return True
+
+
+def _patch_rspack_js(assets, contents):
+    """Patch the numeric-chunk renderer introduced in desktop 26.1029."""
+    print("    Detected Rspack numeric chunks (26.1029+ adapter).")
+    print("\n  [Module 1] Fast mode and service tier")
+    _patch_rspack_fast_ui(contents)
+    request_fp = _rspack_fast_request_file(contents)
+    if request_fp is not None:
+        _patch_rspack_fast_request_gate(contents, request_fp)
+        _patch_rspack_fast_custom_provider(contents, request_fp)
+    _patch_rspack_saved_service_tier(contents)
+
+    print("\n  [Module 2] Latest models and reasoning efforts")
+    _patch_rspack_models_and_reasoning(contents)
+
+    print("\n  [Module 3] i18n")
+    _patch_rspack_i18n(contents)
+
+    print("\n  [Module 4] Browser / Computer Use")
+    _patch_rspack_desktop_gates(contents)
+    print("    [SKIP] Computer Use Node runtime (not present in 26.1013+)")
+
+    print("\n  [Module 5] Legacy plugin connector UI gate")
+    print("\n  [Module 6] Branding and plugin marketplace gate")
+    _rspack_native_plugin_support(contents)
+
+    print("\n  [Module 7] Dictation")
+    _patch_rspack_dictation(contents)
+
+    print("\n  [Module 8] Usage settings")
+    _patch_rspack_usage_settings(contents)
+
+
 def step_patch_js(assets):
     print(f"[5] Applying JavaScript patches...")
     print(f"    {assets}\n")
     main_build = _desktop_main_build(assets)
+
+    rspack_contents = _rspack_asset_contents(assets)
+    if rspack_contents is not None:
+        _patch_rspack_js(assets, rspack_contents)
+        if IS_WINDOWS and main_build and os.path.isdir(main_build):
+            print("\n  [Module 9] Windows taskbar identity")
+            apply_windows_app_user_model_id_patch(main_build)
+        return
 
     # -- Module 1: Fast mode and service tier (2 patches) ---------------
     # Current builds (26.602+) keep this logic in
@@ -1839,7 +2772,7 @@ def step_patch_js(assets):
     # In 26.707+, request construction applies a second chatgpt-only check.
     request_tier_files = _find(assets, "read-service-tier-for-request-*.js")
     if not request_tier_files:
-        for f in glob.glob(os.path.join(assets, "*.js")):
+        for f in _find(assets, "*.js"):
             with open(f, encoding="utf-8") as fh:
                 c = fh.read()
             if "Failed to read service tier for request" in c:
@@ -1873,7 +2806,7 @@ def step_patch_js(assets):
     print("\n  [Module 2] Latest models and reasoning efforts")
     model_filter_files = _find(assets, "model-list-filter-*.js")
     if not model_filter_files:
-        for f in glob.glob(os.path.join(assets, "*.js")):
+        for f in _find(assets, "*.js"):
             with open(f, encoding="utf-8") as fh:
                 c = fh.read()
             if "useHiddenModels" in c and ".hidden" in c and ".supportedReasoningEfforts" in c:
@@ -1910,7 +2843,7 @@ def step_patch_js(assets):
             r'[a-zA-Z_$]+=true\|\|\([a-zA-Z_$]+\?\.models\.some\('
             r'[a-zA-Z_$]+\)\?\?!1\)'
         )
-        for f in glob.glob(os.path.join(assets, "*.js")):
+        for f in _find(assets, "*.js"):
             with open(f, encoding="utf-8") as fh:
                 c = fh.read()
             if legacy_pattern.search(c) or legacy_skip_pattern.search(c):
@@ -1946,7 +2879,7 @@ def step_patch_js(assets):
         rf'=true\|\|{i18n_identifier}\?\.get\(`enable_i18n`,!1\)'
     )
     files = []
-    for fp in glob.glob(os.path.join(assets, "*.js")):
+    for fp in _find(assets, "*.js"):
         with open(fp, encoding="utf-8") as fh:
             content = fh.read()
         if "`enable_i18n`" not in content:
@@ -1980,7 +2913,7 @@ def step_patch_js(assets):
         "featureName:`computer_use`",
         "isComputerUseGateEnabled",
     )
-    for fp in glob.glob(os.path.join(assets, "*.js")):
+    for fp in _find(assets, "*.js"):
         with open(fp, encoding="utf-8") as fh:
             content = fh.read()
         desktop_gate_feature_present = (
@@ -2004,7 +2937,7 @@ def step_patch_js(assets):
         r'[a-zA-Z_$][a-zA-Z0-9_$]*\.available&&'
         r'[a-zA-Z_$][a-zA-Z0-9_$]*'
     )
-    for fp in glob.glob(os.path.join(assets, "*.js")):
+    for fp in _find(assets, "*.js"):
         with open(fp, encoding="utf-8") as fh:
             content = fh.read()
         node_runtime_feature_present = (
@@ -2092,7 +3025,7 @@ def step_patch_js(assets):
                     if "chatgpt" not in fh.read():
                         files = []
         if not files:
-            for f in glob.glob(os.path.join(assets, "*.js")):
+            for f in _find(assets, "*.js"):
                 with open(f, encoding="utf-8") as fh:
                     if re.search(r'function [a-zA-Z_$]+\([a-zA-Z_$]+\)\{return [a-zA-Z_$]+!==`chatgpt`\}', fh.read()):
                         files = [f]; break
@@ -2122,7 +3055,7 @@ def step_patch_js(assets):
                 r'[a-zA-Z_$]+&&\([a-zA-Z_$]+\.authMethod===`chatgpt`\|\|'
                 r'[a-zA-Z_$]+\.authMethod===`apikey`\)'
             )
-            for f in glob.glob(os.path.join(assets, "*.js")):
+            for f in _find(assets, "*.js"):
                 with open(f, encoding="utf-8") as fh:
                     c = fh.read()
                 if "dictation" in c.lower() and (
@@ -2140,7 +3073,7 @@ def step_patch_js(assets):
     if not _patch_usage_settings_capability_gate(assets):
         files = _find(assets, "use-usage-settings-access-*.js")
         if not files:
-            for f in glob.glob(os.path.join(assets, "*.js")):
+            for f in _find(assets, "*.js"):
                 with open(f, encoding="utf-8") as fh:
                     if re.search(r'let [a-zA-Z_$]+=[a-zA-Z_$]+===`chatgpt`', fh.read()):
                         files = [f]; break
@@ -2206,6 +3139,31 @@ _IMAGE_GENERATION_BINARY_PATCH_SETS = (
                 bytes.fromhex(
                     "48 8b 85 68 06 00 00 e9 f1 fb ff ff 90 90 90 90 "
                     "48 8b 85 98 06 00 00"
+                ),
+            ),
+        ),
+    ),
+    (
+        "desktop 26.1029 / codex-cli 0.166.0-alpha.6",
+        (
+            (
+                "Image generation extension provider gate",
+                bytes.fromhex(
+                    "44 88 a6 b8 03 00 00 0f 10 85 28 03 00 00"
+                ),
+                bytes.fromhex(
+                    "c6 86 b8 03 00 00 01 0f 10 85 28 03 00 00"
+                ),
+            ),
+            (
+                "Image generation tool authentication gate",
+                bytes.fromhex(
+                    "48 89 85 c0 03 00 00 80 b8 c8 03 00 00 00 "
+                    "0f 84 b0 01 00 00 41 b8 10 00 00 00"
+                ),
+                bytes.fromhex(
+                    "48 89 85 c0 03 00 00 80 b8 c8 03 00 00 00 "
+                    "90 90 90 90 90 90 41 b8 10 00 00 00"
                 ),
             ),
         ),

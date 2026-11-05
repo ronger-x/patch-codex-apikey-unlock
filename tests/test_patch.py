@@ -143,6 +143,123 @@ def write_supported_assets(assets):
     }
 
 
+def write_261029_rspack_assets(assets):
+    """Write a compact numeric-chunk fixture for the 26.1029 renderer."""
+    async_dir = assets / "async"
+    async_dir.mkdir(parents=True)
+    (assets / "package.json").write_text(
+        '{"type":"module"}', encoding="utf-8"
+    )
+
+    main = async_dir / "24191.589dcc9878.js"
+    main.write_text(
+        "async function resolver(e,t){let[f,m]=await Promise.all(["
+        "d.rpc.getAccount({priority:\"critical\"}),"
+        "d.rpc.getAuthMethod({priority:\"critical\"})]);"
+        "if(\"personalAccessToken\"===m)return m;var u=f.account;"
+        "if(null==u)return null;let g=u.type;return\"apiKey\"===g?"
+        "\"apikey\":\"amazonBedrock\"===g||\"chatgpt\"===g?g:null}"
+        "async function fast(e,t){let n=await (0,o.s)(e,t);"
+        "if(\"chatgpt\"!==n&&\"personalAccessToken\"!==n&&"
+        "\"amazonBedrock\"!==n)return null;console.error("
+        "\"Failed to read service tier for request\");return n}"
+        "let saved={async readServiceTier(r){if(\"local\"===e.getHostId()&&"
+        "await t.isUsingCopilotInference())return!1;let n=await "
+        "e.getAccount({priority:\"critical\"});return n.account?.type==="
+        "\"chatgpt\"||n.account?.type===\"amazonBedrock\"}};"
+        "function modelFilter({additionalAvailableModels:e,"
+        "apiKeyDaybreakSupported:t=!1,authMethod:n,availableModels:a,"
+        "defaultModel:s,enabledReasoningEfforts:o,"
+        "hasConfiguredModelCatalog:l,includeUltraReasoningEffort:u,"
+        "isCustomModelProvider:d=!1,models:c,useHiddenModels:p}){"
+        "let h=[],f=null,m=c.some(e=>e.supportedReasoningEfforts.some("
+        "({reasoningEffort:e})=>\"max\"===e)),g=u&&c.some(e=>"
+        "e.supportedReasoningEfforts.some(({reasoningEffort:e})=>"
+        "\"ultra\"===e));return c.forEach(i=>{if(function("
+        "{additionalAvailableModels:e,apiKeyDaybreakSupported:t,"
+        "authMethod:n,availableModels:r,hasConfiguredModelCatalog:i,"
+        "isCustomModelProvider:a,model:s,useHiddenModels:o}){let l="
+        "s.availableAccessPrograms?.cyber;return(\"apikey\"!==n||!!t||"
+        "null==l||!(l.length>0)||!!l.includes(\"standard\"))&&("
+        "e?.has(s.model)===!0||\"codex-auto-review\"!==s.model&&("
+        "i&&!s.hidden||(o&&!a&&\"amazonBedrock\"!==n?r.has(s.model)||"
+        "\"apikey\"===n&&t&&!s.hidden&&l?.some(e=>\"standard\"!==e)"
+        "===!0:!s.hidden)))}({additionalAvailableModels:e,"
+        "apiKeyDaybreakSupported:t,authMethod:n,availableModels:a,"
+        "hasConfiguredModelCatalog:l,isCustomModelProvider:d,model:i,"
+        "useHiddenModels:p})){let e=u?i.supportedReasoningEfforts:"
+        "i.supportedReasoningEfforts.filter(({reasoningEffort:e})=>"
+        "\"ultra\"!==e),t=(\"copilot\"===n?[e.find(e=>\"medium\""
+        "===e.reasoningEffort)??{reasoningEffort:\"medium\"}]:e).filter("
+        "({reasoningEffort:e})=>(0,r.eE)(e)&&o.has(e)),a={...i,"
+        "supportedReasoningEfforts:t};h.push(a),i.isDefault&&(f=a)}}),"
+        "null==f&&(f=h.find(e=>e.model===s)??null),{models:h,"
+        "defaultModel:f,hasModelSupportingMaxReasoningEffort:m,"
+        "hasModelSupportingUltraReasoningEffort:g}}"
+        "let i18n=x?.get(\"enable_i18n\",!1);"
+        "function computer(host){let gate=(0,h.Zj)(\"1506311413\"),"
+        "state=(0,u.tn)(host),method=state?.authMethod??null;return "
+        "resolve({featureName:\"computer_use\","
+        "isComputerUseGateEnabled:gate})}"
+        "function external(host){let gate=(0,u.Zj)(\"410065390\"),"
+        "state=(0,s.tn)(host),method=state?.authMethod??null;return "
+        "resolve({featureName:\"browser_use_external\","
+        "isExternalBrowserUseGateEnabled:gate})}"
+        "function browser(host){let gate=(0,d.Zj)(\"410262010\"),"
+        "state=(0,o.tn)(host),method=state?.authMethod??null;return "
+        "resolve({featureName:\"browser_use\","
+        "isBrowserAgentGateEnabled:gate})}"
+        "function capabilities(n,s){return\"chatgpt\"!==n.authMethod&&"
+        "\"allowed\"===s.status?{status:\"denied\","
+        "reason:\"unsupported-auth\"}:s}",
+        encoding="utf-8",
+    )
+
+    fast_ui = []
+    for chunk, account, flag, method in (
+        ("293748.534685118d.js", "m", "g", "h"),
+        ("465814.879bc2db3c.js", "a", "b", "c"),
+    ):
+        path = async_dir / chunk
+        path.write_text(
+            f"const modules={{ipV4(e,t,n){{function hook({account}){{let "
+            f"{flag}={account}?.authMethod==="
+            f"\"chatgpt\"||{account}?.authMethod===\"personalAccessToken\"||"
+            f"{account}?.authMethod===\"amazonBedrock\",{method}="
+            f"{account}?.authMethod??null;return{{serviceTierAccess:{flag},"
+            f"isLoading:{method}" + "}}}};",
+            encoding="utf-8",
+        )
+        fast_ui.append(path)
+
+    usage = []
+    for chunk, flag, auth in (
+        ("367895.4408b48bc6.js", "g", "e"),
+        ("435221.eac941d988.js", "h", "a"),
+    ):
+        path = async_dir / chunk
+        path.write_text(
+            f"let result=function({{authMethod:{auth},plan:p}}){{let {flag}="
+            f"\"chatgpt\"==={auth},manage={flag}&&p,view={flag}||manage;"
+            "return{canManageCreditSettings:manage,"
+            "canViewCreditSettings:view,isUsageSettingsVisible:view}}"
+            "({authMethod:null,plan:!0});",
+            encoding="utf-8",
+        )
+        usage.append(path)
+
+    plugin = async_dir / "357959.de4ec41383.js"
+    plugin.write_text(
+        "const modules={v5LP(e,t,n){function directory(){let state=getAuth(),"
+        "supported=((0,y.L)("
+        "state?.authMethod??null)||state?.authMethod===\"apikey\")&&ready,"
+        "{hiddenPluginIds:hidden}=settings(),query={productContext:"
+        "\"catalog\"};return{supported,hidden,query}}}};",
+        encoding="utf-8",
+    )
+    return {"main": main, "fast_ui": fast_ui, "usage": usage, "plugin": plugin}
+
+
 @contextlib.contextmanager
 def loaded_patch_module():
     """Load patch.py through its supported assets-only path for unit testing."""
@@ -221,6 +338,98 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
             self.assertEqual([], workflow["results"]["failed"])
             self.assertNotIn("JS inspection skipped", output.getvalue())
             self.assertEqual(before, {path: path.read_bytes() for path in assets.iterdir()})
+
+    def test_261029_rspack_numeric_chunks_are_patched_idempotently(self):
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "Node.js is required for syntax validation")
+        with tempfile.TemporaryDirectory() as tmp:
+            assets = Path(tmp) / "app" / "webview" / "assets"
+            assets.mkdir(parents=True)
+            fixture = write_261029_rspack_assets(assets)
+            plugin_before = fixture["plugin"].read_bytes()
+
+            first = self.run_patch(assets)
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            self.assertNotIn("[FAIL]", first.stdout)
+            self.assertIn("Detected Rspack numeric chunks", first.stdout)
+
+            main = fixture["main"].read_text("utf-8")
+            self.assertIn(
+                'if("chatgpt"!==n&&"apikey"!==n&&'
+                '"personalAccessToken"!==n&&"amazonBedrock"!==n)'
+                'return null;',
+                main,
+            )
+            self.assertIn(
+                "async function resolver(e,t,__codexAllowCustomProvider=!1)",
+                main,
+            )
+            self.assertIn('(0,o.s)(e,t,!0)', main)
+            self.assertIn(
+                '__codexAllowCustomProvider&&f.requiresOpenaiAuth===!1?'
+                '"apikey":null',
+                main,
+            )
+            self.assertIn('n.account?.type==="apiKey"', main)
+            self.assertIn(
+                '"codex-auto-review"!==s.model&&("apikey"===n||', main
+            )
+            self.assertGreaterEqual(
+                main.count('"apikey"===n||null==n&&d'), 3
+            )
+            self.assertIn('let i18n=!0||x?.get("enable_i18n",!1)', main)
+            self.assertEqual(
+                3, main.count('gate=gate||method==="apikey";')
+            )
+            self.assertIn(
+                '"chatgpt"!==n.authMethod&&"apikey"!==n.authMethod&&'
+                '"allowed"===s.status',
+                main,
+            )
+
+            for path in fixture["fast_ui"]:
+                content = path.read_text("utf-8")
+                self.assertIn('?.authMethod==="apikey"', content)
+                self.assertIn('?.requiresAuth===!1', content)
+            for path in fixture["usage"]:
+                self.assertRegex(
+                    path.read_text("utf-8"),
+                    r'let [a-zA-Z_$]+="chatgpt"===[a-zA-Z_$]+'
+                    r'\|\|"apikey"===[a-zA-Z_$]+',
+                )
+            self.assertEqual(plugin_before, fixture["plugin"].read_bytes())
+
+            for path in assets.rglob("*.js"):
+                checked = subprocess.run(
+                    [node, "--check", str(path)],
+                    cwd=REPO_ROOT,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=False,
+                )
+                self.assertEqual(
+                    checked.returncode,
+                    0,
+                    f"{path}: {checked.stdout}{checked.stderr}",
+                )
+
+            snapshot = {
+                path.relative_to(assets): path.read_bytes()
+                for path in assets.rglob("*") if path.is_file()
+            }
+            second = self.run_patch(assets)
+            self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+            self.assertNotIn("[FAIL]", second.stdout)
+            self.assertIn("[SKIP] Fast request service tier gate", second.stdout)
+            self.assertEqual(
+                snapshot,
+                {
+                    path.relative_to(assets): path.read_bytes()
+                    for path in assets.rglob("*") if path.is_file()
+                },
+            )
 
     def test_custom_provider_reasoning_and_capability_upgrade(self):
         node = shutil.which("node")
@@ -960,6 +1169,34 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
             self.assertEqual(patched, bootstrap.read_bytes())
             self.assertFalse(patch_module.results["failed"])
 
+    def test_261029_windows_taskbar_identity_follows_split_bootstrap_helper(self):
+        with loaded_patch_module() as patch_module, tempfile.TemporaryDirectory() as tmp:
+            main_build = Path(tmp)
+            helper = main_build / "early-bootstrap.js"
+            helper_source = (
+                "function identity(flavor){switch(flavor){"
+                "case enum1.t.Prod:return\"com.openai.codex\";"
+                "case enum1.t.Dev:return\"com.openai.codex.dev\"}}"
+            )
+            helper.write_text(helper_source, encoding="utf-8")
+            caller = main_build / "early-bootstrap-339-test.js"
+            caller.write_text(
+                "electron.app.setAppUserModelId((0,m.m)(flavor));",
+                encoding="utf-8",
+            )
+            worker = main_build / "worker.js"
+            worker.write_text(helper_source, encoding="utf-8")
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                patch_module.apply_windows_app_user_model_id_patch(str(main_build))
+
+            self.assertIn(
+                'case enum1.t.Prod:return"com.openai.codex.patched"',
+                helper.read_text("utf-8"),
+            )
+            self.assertEqual(helper_source, worker.read_text("utf-8"))
+            self.assertFalse(patch_module.results["failed"])
+
     def test_26721_additional_models_filter_is_patched_idempotently(self):
         with tempfile.TemporaryDirectory() as tmp:
             assets = Path(tmp)
@@ -1403,8 +1640,8 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
             mixed = Path(tmp) / "mixed.exe"
             _, latest_patches = patch_module._IMAGE_GENERATION_BINARY_PATCH_SETS[-1]
             mixed_image = (
-                b"MZprefix" + originals[0] + b"separator"
-                + first_patches[1][1] + b"mixed" + latest_patches[1][1]
+                b"MZprefix" + first_patches[0][1]
+                + b"mixed" + latest_patches[1][1]
                 + b"suffix"
             )
             mixed.write_bytes(mixed_image)
