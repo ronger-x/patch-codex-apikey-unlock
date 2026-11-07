@@ -7,7 +7,7 @@ description: |
   but hidden by experiment configuration, and remove API key gates from
   Fast/Speed, Browser, Computer Use, and built-in image generation.
 metadata:
-  version: 4.9.0
+  version: 4.10.0
 ---
 
 # Patch ChatGPT Codex - Unlock API Key Mode Features
@@ -16,7 +16,7 @@ metadata:
 
 Remove desktop UI gates that still depend on ChatGPT sign-in context when using API key mode.
 
-Verified with Windows Store versions `26.707.3748.0`, `26.930.4958.0`, `26.1007.9446.0`, `26.1021.3705.0`, `26.1023.6621.0`, and `26.1029.7803.0`, and macOS app versions `26.707.31428` and `26.1013.31256` (Apple Silicon). The display name and main entry point have changed to ChatGPT, but package names and directories may still use Codex. The script reads the MSIX manifest or macOS `Info.plist` as appropriate and retains fallback support for the old name.
+Verified with Windows Store versions `26.707.3748.0`, `26.930.4958.0`, `26.1007.9446.0`, `26.1021.3705.0`, `26.1023.6621.0`, and `26.1029.7803.0`, and macOS app versions `26.707.31428` and `26.1013.31256` (Apple Silicon). The current adapter also targets Store package `26.1103.3517.0`, which bundles Codex CLI `0.167.0-alpha.3.2`; its JavaScript, native-signature, full-workflow, and startup-smoke checks pass. The display name and main entry point have changed to ChatGPT, but package names and directories may still use Codex. The script reads the MSIX manifest or macOS `Info.plist` as appropriate and retains fallback support for the old name.
 
 ### Unlocked Features
 
@@ -32,7 +32,7 @@ Verified with Windows Store versions `26.707.3748.0`, `26.930.4958.0`, `26.1007.
 | 8 | Voice input/dictation | ChatGPT mode only | Expand to `chatgpt \|\| apikey` |
 | 9 | Usage/billing settings | ChatGPT mode only | Expand to `chatgpt \|\| apikey` |
 | 10 | i18n localization | API key mode has no Statsig user context | Force enablement |
-| 11 | Built-in image generation | Native extension creation and tool exposure require OpenAI/Codex authentication | On Windows 26.1021, 26.1023, and 26.1029, remove only the two authentication-type gates and retain feature, plan, provider-capability, and model-modality checks |
+| 11 | Built-in image generation | Native extension creation and tool exposure require OpenAI/Codex authentication | On Windows 26.1021, 26.1023, 26.1029, and 26.1103, remove only the two authentication-type gates and retain feature, plan, provider-capability, and model-modality checks |
 
 ## Prerequisites
 
@@ -184,7 +184,7 @@ For a custom provider with `requires_openai_auth = false`, `account/read` can re
 
 Locate the complete authorization assignment and its adjacent authentication-method assignment. Older chunks return `isServiceTierAllowed`; `26.1007` returns a `serviceTierAccess` map in `app-initial-*.js`. Consumer chunks also reference these fields, so require the complete gate expression and a unique target before editing.
 
-Windows `26.1029` moves business code into numeric Rspack chunks under `webview/assets/async`, changes most literals to double quotes, and commonly reverses comparisons to constant-left form. The `ipV4` Fast hook is emitted in multiple route chunks. Scan the async tree once, distinguish the `ipV4` module definitions from `serviceTierAccess` consumers, validate every definition as original or already patched, and only then update the complete group. Apply the same all-copies validation to the duplicated usage-settings module and native plugin-directory detector.
+Windows `26.1029` moves business code into numeric Rspack chunks under `webview/assets/async`, changes most literals to double quotes, and commonly reverses comparisons to constant-left form. Store `26.1103.3517.0` continues this layout and adds an anonymous shared service-tier resolver. The `ipV4` Fast hook is emitted in multiple route chunks. Scan the async tree once, distinguish the `ipV4` module definitions from `serviceTierAccess` consumers, validate every definition as original or already patched, and only then update the complete group. Apply the same all-copies validation to the duplicated usage-settings module and native plugin-directory detector.
 
 ```bash
 rg -l 'isServiceTierAllowed|serviceTierAccess|canUseFastMode' -g '*.js'
@@ -285,7 +285,7 @@ grep -rn "enable_i18n" *.js
 
 ### 11. Built-in Image Generation
 
-Windows app `26.1021.31345` ships Codex CLI `0.164.0-alpha.11.1`, app `26.1023.51421` ships CLI `0.165.0-alpha.1.2`, and Store package `26.1029.7803.0` (app `26.1029.61003`) ships CLI `0.166.0-alpha.6`. Their native app-server contains two independent image-generation gates:
+Windows app `26.1021.31345` ships Codex CLI `0.164.0-alpha.11.1`, app `26.1023.51421` ships CLI `0.165.0-alpha.1.2`, Store package `26.1029.7803.0` (app `26.1029.61003`) ships CLI `0.166.0-alpha.6`, and Store package `26.1103.3517.0` ships CLI `0.167.0-alpha.3.2`. Their native app-server contains two independent image-generation gates. The `26.1103` binary uses the same two machine-code signatures as `26.1029`, so both versions share one signature set:
 
 1. `ext/image-generation/src/extension.rs` creates the extension only for the OpenAI provider, providers requiring OpenAI authentication, or Actor Authorization providers.
 2. `core/src/tools/spec_plan.rs::image_generation_available` repeats an authentication/backend check after the real feature, plan, provider-capability, and model-modality checks.
@@ -301,9 +301,11 @@ The image tool uses the configured provider's Images client. Responses-compatibl
 
 The Windows binary patch must use full, coherent, version-specific machine-code signature sets for both the original and already-patched states. Require exactly one supported set and one state per gate, validate every gate before writing, write through a temporary copy, and replace atomically. Reject missing, duplicate, mixed, or multiply matching signatures. Preserve `codex.exe.imagegen.bak` for traditional-install rollback. `--assets` cannot apply or validate this native patch.
 
-This patch is currently verified for Windows `26.1021` (Codex CLI `0.164.0-alpha.11.1`), `26.1023` (CLI `0.165.0-alpha.1.2`), and `26.1029` (CLI `0.166.0-alpha.6`). Do not apply its PE signatures to macOS Mach-O or the bundled Linux/WSL binary. On a new Codex version, rebuild the exact source tag with symbols, locate both source decisions, derive new contextual signatures, and verify them against the shipped `resources/codex.exe` before updating the script.
+Native signature matching is currently verified for Windows `26.1021` (Codex CLI `0.164.0-alpha.11.1`), `26.1023` (CLI `0.165.0-alpha.1.2`), `26.1029` (CLI `0.166.0-alpha.6`), and `26.1103` (CLI `0.167.0-alpha.3.2`). The complete `26.1103` workflow and a 12-second startup smoke test passed on 2026-11-07. Do not apply its PE signatures to macOS Mach-O or the bundled Linux/WSL binary. On a new Codex version, rebuild the exact source tag with symbols, locate both source decisions, derive new contextual signatures, and verify them against the shipped `resources/codex.exe` before updating the script.
 
 The Windows `26.1029.7803.0` rebuild on 2026-11-05 applied 28 patches, skipped 2 obsolete or natively supported gates, and reported zero failures. It passed 45 tests and 787 subtests, packed-ASAR inspection, single-occurrence Windows ASAR hash verification, native original/patched signature counts, `codex.exe --version`, shortcut inspection, and a short process-startup smoke test.
+
+The Windows Store `26.1103.3517.0` rebuild on 2026-11-07 applied 38 patches, skipped 2 obsolete or natively supported gates, and reported zero failures. It passed 46 tests and 787 subtests, packed-ASAR/header-hash inspection, native original/patched signature counts, `codex.exe --version`, shortcut inspection, and a 12-second process-startup smoke test. The official Store package remained unchanged.
 
 ## How It Works
 
@@ -321,7 +323,7 @@ The Windows `26.1029.7803.0` rebuild on 2026-11-05 applied 28 patches, skipped 2
 | Allow request-level service tiers | Showing the Fast option alone does not change actual requests | `read-service-tier-for-request-*` |
 | Enable the desktop availability gate | Bundled plugins are removed when API key mode has no Statsig user context | Desktop feature chunk |
 | Enable the Computer Use runtime gate | A Node runtime must still be selected after availability is established | Desktop feature sync chunk |
-| Unlock built-in image generation | The native app-server creates and exposes the image extension only for selected authentication types | `resources/codex.exe` (Windows 26.1021, 26.1023, and 26.1029) |
+| Unlock built-in image generation | The native app-server creates and exposes the image extension only for selected authentication types | `resources/codex.exe` (Windows 26.1021, 26.1023, 26.1029, and 26.1103) |
 | Fall back when the Browser signing identity is missing | An ad-hoc outer app prevents complete responsible-process identity resolution | `.vite/build/main-*` (macOS only) |
 | Bypass Statsig experiments | API key mode has no Statsig user context, so i18n/feature experiments default to disabled | webview JS |
 | Bypass `authMethod` gates | Multiple features check `=== 'chatgpt'`, excluding API key mode | webview JS |

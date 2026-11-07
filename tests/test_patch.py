@@ -260,6 +260,30 @@ def write_261029_rspack_assets(assets):
     return {"main": main, "fast_ui": fast_ui, "usage": usage, "plugin": plugin}
 
 
+def write_261103_anonymous_fast_asset(path, *, duplicate_call=False):
+    """Write the shared mGK9/PAzX Fast resolver shape from desktop 26.1103."""
+    call = "(0,r.s)(e,t)"
+    if duplicate_call:
+        call = f"{call};await {call}"
+    source = (
+        "const modules={"
+        "mGK9(e,t,n){n.d(t,{},{s:async function(e,t){"
+        "let[r,a]=await Promise.all([d.rpc.getAccount({priority:\"critical\"}),"
+        "d.rpc.getAuthMethod({priority:\"critical\"})]);"
+        "var c=r.account;if(null==c)return null;"
+        "return a===\"personalAccessToken\"?a:"
+        "\"apiKey\"===c.type?\"apikey\":null}})},"
+        "PAzX(e,t,n){let r=n(\"mGK9\");"
+        "async function read(e,t){let n=await "
+        f"{call};"
+        "if(\"chatgpt\"!==n&&\"personalAccessToken\"!==n)return null;"
+        "console.error(\"Failed to read service tier for request\");"
+        "return n}}};"
+    )
+    path.write_text(source, encoding="utf-8")
+    return source
+
+
 @contextlib.contextmanager
 def loaded_patch_module():
     """Load patch.py through its supported assets-only path for unit testing."""
@@ -430,6 +454,79 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
                     for path in assets.rglob("*") if path.is_file()
                 },
             )
+
+    def test_261103_anonymous_fast_resolver_is_idempotent_and_fails_closed(self):
+        with loaded_patch_module() as patch_module, tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "265759.a607bc9dec.js"
+            source = write_261103_anonymous_fast_asset(target)
+            contents = {str(target): source}
+            patch_module.DRY_RUN = False
+            patch_module.results = {"applied": [], "skipped": [], "failed": []}
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertTrue(
+                    patch_module._patch_rspack_fast_request_gate(
+                        contents, str(target)
+                    )
+                )
+                self.assertTrue(
+                    patch_module._patch_rspack_fast_custom_provider(
+                        contents, str(target)
+                    )
+                )
+
+            patched = target.read_text("utf-8")
+            self.assertIn(
+                "s:async function(e,t,__codexAllowCustomProvider=!1)",
+                patched,
+            )
+            self.assertIn(
+                'if(null==c)return __codexAllowCustomProvider&&'
+                'r.requiresOpenaiAuth===!1?"apikey":null;',
+                patched,
+            )
+            self.assertIn("(0,r.s)(e,t,!0)", patched)
+            self.assertIn(
+                'if("chatgpt"!==n&&"apikey"!==n&&'
+                '"personalAccessToken"!==n)return null;',
+                patched,
+            )
+            self.assertEqual(2, len(patch_module.results["applied"]))
+            self.assertEqual([], patch_module.results["failed"])
+
+            patch_module.results = {"applied": [], "skipped": [], "failed": []}
+            contents[str(target)] = patched
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertTrue(
+                    patch_module._patch_rspack_fast_request_gate(
+                        contents, str(target)
+                    )
+                )
+                self.assertTrue(
+                    patch_module._patch_rspack_fast_custom_provider(
+                        contents, str(target)
+                    )
+                )
+            self.assertEqual(patched, target.read_text("utf-8"))
+            self.assertEqual([], patch_module.results["applied"])
+            self.assertEqual(2, len(patch_module.results["skipped"]))
+
+            ambiguous = Path(tmp) / "ambiguous.js"
+            ambiguous_source = write_261103_anonymous_fast_asset(
+                ambiguous, duplicate_call=True
+            )
+            ambiguous_contents = {str(ambiguous): ambiguous_source}
+            patch_module.results = {"applied": [], "skipped": [], "failed": []}
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertFalse(
+                    patch_module._patch_rspack_fast_custom_provider(
+                        ambiguous_contents, str(ambiguous)
+                    )
+                )
+            self.assertEqual(ambiguous_source, ambiguous.read_text("utf-8"))
+            self.assertEqual([], patch_module.results["applied"])
+            self.assertEqual([], patch_module.results["skipped"])
+            self.assertEqual(1, len(patch_module.results["failed"]))
 
     def test_custom_provider_reasoning_and_capability_upgrade(self):
         node = shutil.which("node")
@@ -1576,6 +1673,12 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
 
     def test_image_generation_binary_patch_is_atomic_idempotent_and_fails_closed(self):
         with loaded_patch_module() as patch_module, tempfile.TemporaryDirectory() as tmp:
+            self.assertTrue(
+                any(
+                    "26.1103" in version and "0.167.0-alpha.3.2" in version
+                    for version, _ in patch_module._IMAGE_GENERATION_BINARY_PATCH_SETS
+                )
+            )
             for index, (version, patches) in enumerate(
                     patch_module._IMAGE_GENERATION_BINARY_PATCH_SETS):
                 with self.subTest(version=version):

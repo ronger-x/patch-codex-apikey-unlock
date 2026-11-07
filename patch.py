@@ -1806,6 +1806,7 @@ def _rspack_asset_contents(assets):
     markers = (
         "serviceTierAccess",
         "Failed to read service tier for request",
+        "Failed to read saved service tier for request",
         "readServiceTier(",
         "apiKeyDaybreakSupported",
         "hasModelSupportingUltraReasoningEffort",
@@ -1908,14 +1909,14 @@ def _patch_rspack_fast_ui(contents):
     return True
 
 
-def _rspack_fast_request_file(contents):
+def _rspack_fast_request_files(contents):
     files = [
         fp for fp, content in contents.items()
         if "Failed to read service tier for request" in content
     ]
-    return _single_patch_target(
-        files, "Fast request service tier gate", required=True
-    )
+    if not files:
+        mark_missing("Fast request service tier gate", "Target file not found")
+    return sorted(files)
 
 
 def _patch_rspack_fast_request_gate(contents, fp):
@@ -1959,6 +1960,102 @@ def _patch_rspack_fast_custom_provider(contents, fp):
     name = "Fast custom-provider request auth"
     identifier = r'[a-zA-Z_$][a-zA-Z0-9_$]*'
     content = contents[fp]
+
+    # 26.1103 keeps the account resolver in the shared mGK9 module and calls
+    # it from the PAzX service-tier reader through an anonymous function. Add
+    # an opt-in argument to that resolver so other callers retain their
+    # existing null-account behavior.
+    resolver_module = re.search(
+        rf'(?P<module>mGK9)\([^)]*\)\{{', content,
+    )
+    service_module = re.search(
+        rf'(?P<module>PAzX)\((?P<args>[^)]*)\)\{{', content,
+    )
+    if resolver_module and service_module:
+        resolver_end = _js_block_end(content, resolver_module.end() - 1)
+        service_end = _js_block_end(content, service_module.end() - 1)
+        resolver_body = (
+            content[resolver_module.end():resolver_end]
+            if resolver_end is not None else ""
+        )
+        service_body = (
+            content[service_module.end():service_end]
+            if service_end is not None else ""
+        )
+        resolver_signature = re.search(
+            rf'(?P<alias>\bs):async function\((?P<scope>{identifier}),'
+            rf'(?P<host>{identifier})(?:,(?P<allow>{identifier})=!1)?\)\{{',
+            resolver_body,
+        )
+        resolver_null = re.search(
+            rf'var (?P<account>{identifier})=(?P<response>{identifier})\.account;'
+            rf'if\(null==(?P=account)\)return '
+            rf'(?:(?P<allow>{identifier})&&(?P=response)\.requiresOpenaiAuth'
+            rf'===!1\?"apikey":null|null);',
+            resolver_body,
+        )
+        service_source = (
+            content[service_module.start():service_end]
+            if service_end is not None else ""
+        )
+        loader = service_module.group("args").split(",")[-1].strip()
+        import_match = re.search(
+            rf'(?P<alias>{identifier})={re.escape(loader)}\("mGK9"\)',
+            service_source,
+        )
+        if resolver_signature and resolver_null and import_match:
+            allow = resolver_signature.group("allow")
+            patched_allow = resolver_null.group("allow")
+            service_alias = import_match.group("alias")
+            call_pattern = re.compile(
+                rf'\(0,{re.escape(service_alias)}\.s\)\('
+                rf'(?P<scope>{identifier}),(?P<host>{identifier})'
+                rf'(?P<enabled>,!0)?\)',
+            )
+            calls = list(call_pattern.finditer(service_body))
+            if len(calls) == 1:
+                resolver_complete = (
+                    allow is not None and patched_allow == allow
+                )
+                caller_complete = calls[0].group("enabled") is not None
+                if resolver_complete and caller_complete:
+                    _record_rspack_skipped(fp, name)
+                    return True
+                edits = []
+                if not resolver_complete:
+                    if allow is None:
+                        used = set(re.findall(identifier, resolver_body))
+                        allow = "__codexAllowCustomProvider"
+                        suffix = 2
+                        while allow in used:
+                            allow = f"__codexAllowCustomProvider{suffix}"
+                            suffix += 1
+                        signature_at = resolver_module.end() + resolver_signature.end() - 2
+                        edits.append((signature_at, signature_at, f",{allow}=!1"))
+                    response = resolver_null.group("response")
+                    account = resolver_null.group("account")
+                    replacement = (
+                        f"var {account}={response}.account;if(null=={account})"
+                        f"return {allow}&&{response}.requiresOpenaiAuth===!1?"
+                        '"apikey":null;'
+                    )
+                    null_start = resolver_module.end() + resolver_null.start()
+                    null_end = resolver_module.end() + resolver_null.end()
+                    edits.append((null_start, null_end, replacement))
+                if not caller_complete:
+                    call = calls[0]
+                    insert_at = service_module.end() + call.end() - 1
+                    edits.append((insert_at, insert_at, ",!0"))
+                for start, end, replacement in sorted(edits, reverse=True):
+                    content = content[:start] + replacement + content[end:]
+                _store_rspack_content(contents, fp, content)
+                _record_rspack_applied(fp, name)
+                return True
+            mark_missing(
+                f"{os.path.basename(fp)}: {name}",
+                "Target structure mismatch",
+            )
+            return False
 
     resolver_candidates = []
     signature_pattern = re.compile(
@@ -2149,7 +2246,8 @@ def _patch_rspack_models_and_reasoning(contents):
     reasoning_name = "Reasoning effort list unlock"
     identifier = r'[a-zA-Z_$][a-zA-Z0-9_$]*'
     signature_pattern = re.compile(
-        rf'function (?P<function>{identifier})\(\{{(?P<fields>[^}}]*)\}}\)\{{'
+        rf'(?:function(?:[ \t]+{identifier})?|{identifier}[ \t]*:[ \t]*function)'
+        rf'\(\{{(?P<fields>[^}}]*)\}}\)\{{'
     )
     candidates = []
     required = (
@@ -2424,7 +2522,8 @@ def _patch_rspack_desktop_gates(contents):
             if feature_marker not in content:
                 continue
             for signature in re.finditer(
-                    rf'function (?P<function>{identifier})\([^)]*\)\{{',
+                    rf'(?:function(?:[ \t]+{identifier})?|'
+                    rf'{identifier}[ \t]*:[ \t]*function)\([^)]*\)\{{',
                     content):
                 end = _js_block_end(content, signature.end() - 1)
                 if end is None:
@@ -2666,10 +2765,10 @@ def _patch_rspack_js(assets, contents):
     print("    Detected Rspack numeric chunks (26.1029+ adapter).")
     print("\n  [Module 1] Fast mode and service tier")
     _patch_rspack_fast_ui(contents)
-    request_fp = _rspack_fast_request_file(contents)
-    if request_fp is not None:
-        _patch_rspack_fast_request_gate(contents, request_fp)
-        _patch_rspack_fast_custom_provider(contents, request_fp)
+    request_files = _rspack_fast_request_files(contents)
+    for request_fp in request_files:
+        if _patch_rspack_fast_request_gate(contents, request_fp):
+            _patch_rspack_fast_custom_provider(contents, request_fp)
     _patch_rspack_saved_service_tier(contents)
 
     print("\n  [Module 2] Latest models and reasoning efforts")
@@ -3144,7 +3243,7 @@ _IMAGE_GENERATION_BINARY_PATCH_SETS = (
         ),
     ),
     (
-        "desktop 26.1029 / codex-cli 0.166.0-alpha.6",
+        "desktop 26.1029 / codex-cli 0.166.0-alpha.6; desktop 26.1103 / codex-cli 0.167.0-alpha.3.2 (identical signatures)",
         (
             (
                 "Image generation extension provider gate",
