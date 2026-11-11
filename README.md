@@ -2,7 +2,7 @@
 
 This project targets the Codex desktop app whose display name has been changed to **ChatGPT**. It unlocks the model list, reasoning effort levels, service tiers, built-in image generation, and other features in API key mode.
 
-It has been verified with Windows Store versions `26.707.3748.0`, `26.930.4958.0`, `26.1007.9446.0`, `26.1021.3705.0`, `26.1023.6621.0`, and `26.1029.7803.0`, and the macOS app versions `26.707.31428` and `26.1013.31256` (Apple Silicon). The current adapter also targets Store package `26.1103.3517.0`, which bundles Codex CLI `0.167.0-alpha.3.2`; its JavaScript, native-signature, full-workflow, and startup-smoke checks pass. In these versions, the display name and primary entry point have changed to ChatGPT, while installation packages may still use the Codex name. The script supports both the old and new names.
+It has been verified with Windows Store versions `26.707.3748.0`, `26.930.4958.0`, `26.1007.9446.0`, `26.1021.3705.0`, `26.1023.6621.0`, and `26.1029.7803.0`, and the macOS app versions `26.707.31428` and `26.1013.31256` (Apple Silicon). The current adapter also targets Store packages `26.1103.3517.0` and `26.1103.7773.0`, which bundle Codex CLI `0.167.0-alpha.3.2`; their JavaScript, native-signature, full-workflow, and startup-smoke checks pass. In these versions, the display name and primary entry point have changed to ChatGPT, while installation packages may still use the Codex name. The script supports both the old and new names.
 
 ## Unlocked Features
 
@@ -19,6 +19,7 @@ It has been verified with Windows Store versions `26.707.3748.0`, `26.930.4958.0
 | Voice input/dictation | Expands availability to `chatgpt \|\| apikey` |
 | Usage/billing settings | Expands availability to `chatgpt \|\| apikey` |
 | i18n languages | Bypasses the Statsig experiment gate and forces the feature on |
+| Location privacy default | Defaults guest sessions and missing precise-location preferences to off in Data controls; preserves explicit account preferences and the existing permission flow |
 | Built-in image generation | On Windows `26.1021`, `26.1023`, `26.1029`, and `26.1103`, exposes `image_gen.imagegen` to eligible API-key/custom-provider sessions while retaining feature, plan, provider-capability, and model-modality checks; `26.1103` reuses the `26.1029` native signature set |
 
 ## Prerequisites
@@ -33,6 +34,7 @@ patch.py                  Main script: one-command workflow for both ChatGPT and
 SKILL.md                  Full technical documentation, including the version-update troubleshooting guide
 tests/test_patch.py       Regression tests for models, reasoning effort, Fast (including 26.1007 custom providers), Browser, CUA, and platform workflows
 tests/test_saved_service_tier.py  Saved Fast request auth, capability limits, and Copilot exclusion
+tests/test_location_privacy.py  Location defaults, explicit preferences, repeated runs, and fail-closed validation
 ```
 
 ## Usage
@@ -148,6 +150,10 @@ The patch does not invent image support. It retains the `[features] image_genera
 Native signature matching is currently verified for Windows `26.1021`, `26.1023`, `26.1029`, and `26.1103` (CLI `0.167.0-alpha.3.2`); macOS is left unchanged. The complete `26.1103` workflow and a 12-second startup smoke test passed on 2026-11-07. A version drift, missing signature, duplicate signature, or mixed signature set fails closed before ASAR repackaging.
 
 ## Version Updates
+
+Store package `26.1103.7773.0` keeps Codex CLI `0.167.0-alpha.3.2` and the existing native image-generation signatures. Its location adapter changes the synthetic guest preference from `true` to `false` and maps an absent account preference to `false`. Both Data controls and the location runtime read this preference. Explicit account values, parental controls, browser permissions, and the existing Turn on/Turn off actions keep their original behavior. The script validates every matching account-settings chunk before writing and rejects changed or ambiguous query shapes.
+
+Validation on 2026-11-11 passed 52 tests. The Windows `26.1103.7773.0` rebuild applied the 38 existing patches and the additional location-default patch without failures; a final assets dry run recognized all 39 JavaScript checks as already satisfied. All 22 changed JavaScript files passed syntax checks and matched their packed ASAR contents, all six native sidecars were present, and the rebuilt header hash occurred exactly once in the copied executable. The backup matched the official archive, the native signatures and CLI version checks passed, and six desktop processes remained responsive during a 12-second startup check with a temporary profile. No billable model request was sent.
 
 After ChatGPT Codex is updated, JavaScript filenames (including hash suffixes) and variable names may change. The script includes automatic fallback searches and usually adapts without modification. If a patch fails, see the **Version Update Troubleshooting Guide** in [SKILL.md](SKILL.md).
 

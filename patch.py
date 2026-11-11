@@ -1788,6 +1788,77 @@ def apply_reasoning_effort_filter_patch(fp, validate_only=False):
     return True
 
 
+def _patch_precise_location_defaults(contents):
+    """Default guest and unspecified location settings to off.
+
+    Preserve explicit server preferences and the existing opt-in/permission
+    flow. Validate all emitted copies before changing any account query.
+    """
+    name = "Precise location defaults off"
+    identifier = r'[a-zA-Z_$][a-zA-Z0-9_$]*'
+    guest_pattern = re.compile(
+        r'\?\{settings:\{precise_location_allowed:(?P<value>![01])\}\}:await'
+    )
+    setting_pattern = re.compile(
+        rf'\bpreciseLocationAllowed:{identifier}\.settings\?\.'
+        r'precise_location_allowed(?P<default>\?\?!1)?(?=[,}])'
+    )
+    query_markers = (
+        "chatgpt-user-settings", "/settings/user", "preciseLocationAllowed"
+    )
+    fallback_marker = "settings:{precise_location_allowed:"
+    candidates = [
+        (fp, content) for fp, content in sorted(contents.items())
+        if all(marker in content for marker in query_markers)
+        or fallback_marker in content
+    ]
+    if not candidates:
+        mark_satisfied("assets", name, "Location account query not present")
+        return True
+
+    updates = []
+    for fp, content in candidates:
+        guest_matches = list(guest_pattern.finditer(content))
+        setting_matches = list(setting_pattern.finditer(content))
+        if (not all(marker in content for marker in query_markers)
+                or len(guest_matches) != 1 or len(setting_matches) != 1):
+            mark_missing(
+                name,
+                f"{os.path.basename(fp)}: expected one guest fallback and "
+                "one location preference mapping; refusing a partial edit",
+            )
+            return False
+        guest = guest_matches[0]
+        setting = setting_matches[0]
+        edits = []
+        if guest.group("value") == "!0":
+            edits.append((guest.start("value"), guest.end("value"), "!1"))
+        if setting.group("default") is None:
+            edits.append((setting.end(), setting.end(), "??!1"))
+        for start, end, replacement in sorted(edits, reverse=True):
+            content = content[:start] + replacement + content[end:]
+        updates.append((fp, content, bool(edits)))
+
+    for fp, content, changed in updates:
+        if changed:
+            _store_rspack_content(contents, fp, content)
+            _record_rspack_applied(fp, name)
+        else:
+            _record_rspack_skipped(fp, name)
+    return True
+
+
+def _patch_location_assets(assets):
+    contents = {}
+    for fp in sorted(_find_recursive(assets, "*.js")):
+        with open(fp, encoding="utf-8") as fh:
+            content = fh.read()
+        if ("chatgpt-user-settings" in content
+                or "settings:{precise_location_allowed:" in content):
+            contents[fp] = content
+    return _patch_precise_location_defaults(contents)
+
+
 def _rspack_asset_contents(assets):
     """Return semantically relevant numbered Rspack chunks, or None.
 
@@ -1818,6 +1889,8 @@ def _rspack_asset_contents(assets):
         "isUsageSettingsVisible",
         'productContext:"catalog"',
         "hiddenPluginIds",
+        "chatgpt-user-settings",
+        "settings:{precise_location_allowed:",
     )
     contents = {}
     for fp in files:
@@ -2791,6 +2864,9 @@ def _patch_rspack_js(assets, contents):
     print("\n  [Module 8] Usage settings")
     _patch_rspack_usage_settings(contents)
 
+    print("\n  [Module 10] Location privacy defaults")
+    _patch_precise_location_defaults(contents)
+
 
 def step_patch_js(assets):
     print(f"[5] Applying JavaScript patches...")
@@ -3183,6 +3259,9 @@ def step_patch_js(assets):
                 lambda m: f"let {m.group(1)}={m.group(2)}===`chatgpt`||{m.group(2)}===`apikey`",
                 skip_regex=r'let [a-zA-Z_$]+=[a-zA-Z_$]+===`chatgpt`\|\|[a-zA-Z_$]+===`apikey`')
 
+    print("\n  [Module 10] Location privacy defaults")
+    _patch_location_assets(assets)
+
     # When Store/traditional installs and the patched copy share the official
     # AUMID, pinned taskbar entries reopen the Store build. Assign a separate
     # identity only to the Windows copy; leave the macOS bundle unchanged.
@@ -3434,10 +3513,10 @@ def step_fuses(exe_path):
             print(f"    {flag}")
 
     if no_sentinel:
-        # OpenAI's owl Electron build does not expose the standard fuse wire,
-        # so a missing sentinel is expected. The patches still take effect
-        # through the normal app.asar load path without changing any fuse.
-        print("    Note: this Electron build does not expose fuse sentinels.")
+        # Split-runtime builds can keep the fuse wire in chrome.dll instead
+        # of the entry executable. The packed patches and refreshed ASAR hash
+        # work without changing those runtime fuses.
+        print("    Note: the entry executable does not expose a fuse sentinel.")
         print("          The patches are already packed into app.asar.")
 
 
