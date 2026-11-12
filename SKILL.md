@@ -32,7 +32,7 @@ Verified with Windows Store versions `26.707.3748.0`, `26.930.4958.0`, `26.1007.
 | 8 | Voice input/dictation | ChatGPT mode only | Expand to `chatgpt \|\| apikey` |
 | 9 | Usage/billing settings | ChatGPT mode only | Expand to `chatgpt \|\| apikey` |
 | 10 | i18n localization | API key mode has no Statsig user context | Force enablement |
-| 11 | Built-in image generation | Native extension creation and tool exposure require OpenAI/Codex authentication | On Windows 26.1021, 26.1023, 26.1029, and 26.1103, remove only the two authentication-type gates and retain feature, plan, provider-capability, and model-modality checks |
+| 11 | Built-in image generation | Native extension creation and tool exposure require OpenAI/Codex authentication | On Windows 26.1021, 26.1023, 26.1029, 26.1103, and 26.1106, remove only the two authentication-type gates and retain feature, plan, provider-capability, and model-modality checks |
 
 ## Prerequisites
 
@@ -138,6 +138,12 @@ Preserve the existing API provider configuration. The patch does not hard-code m
 ---
 
 ## Troubleshooting Version Updates
+
+Store package `26.1106.6628.0` (app `26.1106.51428`, Codex CLI `0.167.0-alpha.4.1`) retains the existing Rspack adapters and the shared `26.1029`/`26.1103` native signature set. Its renderer emits seven Fast UI modules, eight service-tier request modules, and seven usage-settings modules. Validate all emitted copies and retain the default behavior of the shared account resolver outside service-tier requests.
+
+Validation on 2026-11-12 passed 52 tests and 794 subtests. The complete `26.1106.6628.0` workflow applied 42 patches, skipped 2 obsolete or natively supported gates, and reported zero failures. A final assets dry run reported 0 applied, 42 skipped, and 0 failed checks.
+
+Verification covered all 24 changed JavaScript files against their packed ASAR entries, Node syntax checks, six native sidecar hashes, matching executable ASAR hashes, the official-archive backup, and both native signature states. The copied CLI version and desktop shortcut checks passed, and five desktop processes stayed alive during a 12-second startup check with a temporary profile and no fatal, integrity, or syntax errors in the startup log. The official Store package remained unchanged; no billable model request was sent.
 
 After ChatGPT Codex updates, both JS filenames (hash suffixes) and variable names may change. Use the following methods to locate each patch target.
 
@@ -301,7 +307,7 @@ The image tool uses the configured provider's Images client. Responses-compatibl
 
 The Windows binary patch must use full, coherent, version-specific machine-code signature sets for both the original and already-patched states. Require exactly one supported set and one state per gate, validate every gate before writing, write through a temporary copy, and replace atomically. Reject missing, duplicate, mixed, or multiply matching signatures. Preserve `codex.exe.imagegen.bak` for traditional-install rollback. `--assets` cannot apply or validate this native patch.
 
-Native signature matching is currently verified for Windows `26.1021` (Codex CLI `0.164.0-alpha.11.1`), `26.1023` (CLI `0.165.0-alpha.1.2`), `26.1029` (CLI `0.166.0-alpha.6`), and `26.1103` (CLI `0.167.0-alpha.3.2`). The complete `26.1103` workflow and a 12-second startup smoke test passed on 2026-11-07. Do not apply its PE signatures to macOS Mach-O or the bundled Linux/WSL binary. On a new Codex version, rebuild the exact source tag with symbols, locate both source decisions, derive new contextual signatures, and verify them against the shipped `resources/codex.exe` before updating the script.
+Native signature matching is currently verified for Windows `26.1021` (Codex CLI `0.164.0-alpha.11.1`), `26.1023` (CLI `0.165.0-alpha.1.2`), `26.1029` (CLI `0.166.0-alpha.6`), `26.1103` (CLI `0.167.0-alpha.3.2`), and `26.1106` (CLI `0.167.0-alpha.4.1`). The complete `26.1103` workflow and a 12-second startup smoke test passed on 2026-11-07. Do not apply its PE signatures to macOS Mach-O or the bundled Linux/WSL binary. On a new Codex version, rebuild the exact source tag with symbols, locate both source decisions, derive new contextual signatures, and verify them against the shipped `resources/codex.exe` before updating the script.
 
 The Windows `26.1029.7803.0` rebuild on 2026-11-05 applied 28 patches, skipped 2 obsolete or natively supported gates, and reported zero failures. It passed 45 tests and 787 subtests, packed-ASAR inspection, single-occurrence Windows ASAR hash verification, native original/patched signature counts, `codex.exe --version`, shortcut inspection, and a short process-startup smoke test.
 
@@ -323,7 +329,7 @@ The Windows Store `26.1103.3517.0` rebuild on 2026-11-07 applied 38 patches, ski
 | Allow request-level service tiers | Showing the Fast option alone does not change actual requests | `read-service-tier-for-request-*` |
 | Enable the desktop availability gate | Bundled plugins are removed when API key mode has no Statsig user context | Desktop feature chunk |
 | Enable the Computer Use runtime gate | A Node runtime must still be selected after availability is established | Desktop feature sync chunk |
-| Unlock built-in image generation | The native app-server creates and exposes the image extension only for selected authentication types | `resources/codex.exe` (Windows 26.1021, 26.1023, 26.1029, and 26.1103) |
+| Unlock built-in image generation | The native app-server creates and exposes the image extension only for selected authentication types | `resources/codex.exe` (Windows 26.1021, 26.1023, 26.1029, 26.1103, and 26.1106) |
 | Fall back when the Browser signing identity is missing | An ad-hoc outer app prevents complete responsible-process identity resolution | `.vite/build/main-*` (macOS only) |
 | Bypass Statsig experiments | API key mode has no Statsig user context, so i18n/feature experiments default to disabled | webview JS |
 | Bypass `authMethod` gates | Multiple features check `=== 'chatgpt'`, excluding API key mode | webview JS |

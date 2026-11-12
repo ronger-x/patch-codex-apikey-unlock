@@ -20,7 +20,7 @@ It has been verified with Windows Store versions `26.707.3748.0`, `26.930.4958.0
 | Usage/billing settings | Expands availability to `chatgpt \|\| apikey` |
 | i18n languages | Bypasses the Statsig experiment gate and forces the feature on |
 | Location privacy default | Defaults guest sessions and missing precise-location preferences to off in Data controls; preserves explicit account preferences and the existing permission flow |
-| Built-in image generation | On Windows `26.1021`, `26.1023`, `26.1029`, and `26.1103`, exposes `image_gen.imagegen` to eligible API-key/custom-provider sessions while retaining feature, plan, provider-capability, and model-modality checks; `26.1103` reuses the `26.1029` native signature set |
+| Built-in image generation | On Windows `26.1021`, `26.1023`, `26.1029`, `26.1103`, and `26.1106`, exposes `image_gen.imagegen` to eligible API-key/custom-provider sessions while retaining feature, plan, provider-capability, and model-modality checks; `26.1103` and `26.1106` reuse the `26.1029` native signature set |
 
 ## Prerequisites
 
@@ -120,7 +120,7 @@ gives the patched desktop shortcut a separate `--user-data-dir`, so an already
 running official instance cannot claim the patched copy's single-instance lock.
 Because the copied executable is modified, Windows may report its vendor
 signature as invalid; the official Store installation keeps its original
-signature and remains untouched. The Windows 26.1021/26.1023/26.1029/26.1103 image-generation patch
+signature and remains untouched. The Windows 26.1021/26.1023/26.1029/26.1103/26.1106 image-generation patch
 also modifies the copied `resources/codex.exe`, invalidating that copy's
 vendor signature.
 
@@ -147,9 +147,15 @@ Windows app `26.1021.31345` bundles Codex CLI `0.164.0-alpha.11.1`, app `26.1023
 
 The patch does not invent image support. It retains the `[features] image_generation = true` flag, Free-plan exclusion, provider capability, and model image-input checks. In this version, Responses-compatible custom providers default to the image-generation capability, but they must still implement compatible `/images/generations` and `/images/edits` endpoints. See the [official OpenAI image-generation guide](https://developers.openai.com/api/docs/guides/image-generation).
 
-Native signature matching is currently verified for Windows `26.1021`, `26.1023`, `26.1029`, and `26.1103` (CLI `0.167.0-alpha.3.2`); macOS is left unchanged. The complete `26.1103` workflow and a 12-second startup smoke test passed on 2026-11-07. A version drift, missing signature, duplicate signature, or mixed signature set fails closed before ASAR repackaging.
+Native signature matching is currently verified for Windows `26.1021`, `26.1023`, `26.1029`, `26.1103` (CLI `0.167.0-alpha.3.2`), and `26.1106` (CLI `0.167.0-alpha.4.1`); macOS is left unchanged. The complete `26.1103` workflow and a 12-second startup smoke test passed on 2026-11-07. A version drift, missing signature, duplicate signature, or mixed signature set fails closed before ASAR repackaging.
 
 ## Version Updates
+
+Store package `26.1106.6628.0` (app `26.1106.51428`) bundles Codex CLI `0.167.0-alpha.4.1`. Its renderer emits seven Fast UI modules, eight service-tier request modules, and seven usage-settings modules. The existing Rspack adapters cover every emitted copy, and both native image-generation signatures remain identical to the shared `26.1029`/`26.1103` set.
+
+Validation on 2026-11-12 passed 52 tests and 794 subtests. The complete `26.1106.6628.0` workflow applied 42 patches, skipped 2 obsolete or natively supported gates, and reported zero failures. A final assets dry run reported 0 applied, 42 skipped, and 0 failed checks.
+
+All 24 changed JavaScript files passed syntax checks and matched their packed ASAR entries; all six native sidecars passed hash checks, and each executable contained its matching ASAR header hash exactly once. The backup matched the official archive, both native gates had the expected original/patched signatures, and the copied CLI reported `0.167.0-alpha.4.1`. Five desktop processes remained alive during a 12-second startup check with a temporary profile, with no fatal, integrity, or syntax errors in the startup log. The official Store package remained unchanged, and no billable model request was sent.
 
 Store package `26.1103.7773.0` keeps Codex CLI `0.167.0-alpha.3.2` and the existing native image-generation signatures. Its location adapter changes the synthetic guest preference from `true` to `false` and maps an absent account preference to `false`. Both Data controls and the location runtime read this preference. Explicit account values, parental controls, browser permissions, and the existing Turn on/Turn off actions keep their original behavior. The script validates every matching account-settings chunk before writing and rejects changed or ambiguous query shapes.
 

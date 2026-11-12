@@ -3322,7 +3322,9 @@ _IMAGE_GENERATION_BINARY_PATCH_SETS = (
         ),
     ),
     (
-        "desktop 26.1029 / codex-cli 0.166.0-alpha.6; desktop 26.1103 / codex-cli 0.167.0-alpha.3.2 (identical signatures)",
+        "desktop 26.1029 / codex-cli 0.166.0-alpha.6; "
+        "desktop 26.1103 / codex-cli 0.167.0-alpha.3.2; "
+        "desktop 26.1106 / codex-cli 0.167.0-alpha.4.1 (identical signatures)",
         (
             (
                 "Image generation extension provider gate",
