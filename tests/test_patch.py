@@ -1239,6 +1239,136 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
             )
             self.assertEqual(payload, untouched.read_text("utf-8"))
 
+    def test_261111_dictation_scope_preserves_cloud_and_voice_permissions(self):
+        source = (
+            'function capabilities(e,status){let n,r,i,s;'
+            'function cloud(){let c={status};return"chatgpt"!==e.authMethod&&'
+            '"allowed"===c.status?{status:"denied",reason:"unsupported-auth"}:c}'
+            'return{cloud:cloud(),voice:(n=e,r=e,i=r?.permissions,'
+            's=null==i||i.includes("chatgpt.workspace.feature.voice.access")?'
+            '{status}:{status:"denied",reason:"permission"},'
+            '"chatgpt"!==n.authMethod&&"allowed"===s.status?'
+            '{status:"denied",reason:"unsupported-auth"}:s),workCloud:cloud()}}'
+        )
+        with loaded_patch_module() as module, tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "capabilities.js"
+            target.write_text(source, encoding="utf-8")
+            contents = {str(target): source}
+            module.results = {"applied": [], "skipped": [], "failed": []}
+            with contextlib.redirect_stdout(io.StringIO()):
+                module.DRY_RUN = True
+                self.assertTrue(module._patch_rspack_dictation(contents))
+                self.assertEqual(source, target.read_text(encoding="utf-8"))
+                module.DRY_RUN = False
+                contents[str(target)] = source
+                self.assertTrue(module._patch_rspack_dictation(contents))
+                first = target.read_bytes()
+                self.assertTrue(module._patch_rspack_dictation(contents))
+            self.assertEqual(first, target.read_bytes())
+            self.assertIn(
+                '"chatgpt"!==e.authMethod&&"allowed"===c.status',
+                contents[str(target)],
+            )
+            runner = contents[str(target)] + (
+                'let rows=[];for(let authMethod of ["apikey","chatgpt","copilot"])'
+                'for(let status of ["allowed","denied","loading"])'
+                'for(let permissions of [null,[],["chatgpt.workspace.feature.voice.access"]])'
+                'rows.push({authMethod,status,permissions,result:capabilities('
+                '{authMethod,permissions},status)});console.log(JSON.stringify(rows));'
+            )
+            checked = subprocess.run(
+                ["node", "-e", runner], capture_output=True, text=True,
+                check=True, timeout=10,
+            )
+            for row in json.loads(checked.stdout):
+                with self.subTest(row=row):
+                    permission = row["permissions"] is None or bool(row["permissions"])
+                    voice = row["status"] if permission else "denied"
+                    if voice == "allowed" and row["authMethod"] == "copilot":
+                        voice = "denied"
+                    cloud = row["status"]
+                    if cloud == "allowed" and row["authMethod"] != "chatgpt":
+                        cloud = "denied"
+                    self.assertEqual(voice, row["result"]["voice"]["status"])
+                    self.assertEqual(cloud, row["result"]["cloud"]["status"])
+                    self.assertEqual(cloud, row["result"]["workCloud"]["status"])
+            for ambiguous in (
+                source + source,
+                source.replace("voice:(", "renamed:("),
+                source.replace("chatgpt.workspace.feature.voice.access", "changed.permission"),
+            ):
+                target.write_text(ambiguous, encoding="utf-8")
+                module.results = {"applied": [], "skipped": [], "failed": []}
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertFalse(module._patch_rspack_dictation({str(target): ambiguous}))
+                self.assertEqual(ambiguous, target.read_text(encoding="utf-8"))
+
+    def test_rspack_i18n_scan_handles_large_embedded_payloads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "locale.js"
+            payload = 'const payload="' + "A" * (256 * 1024) + '";'
+            target.write_text(
+                payload + 'let $flag=client?.get("enable_i18n",!1);',
+                encoding="utf-8",
+            )
+            code = """
+import contextlib, io, runpy, sys
+from pathlib import Path
+helpers = runpy.run_path(sys.argv[1])
+target = Path(sys.argv[2])
+with helpers['loaded_patch_module']() as module:
+    contents = {str(target): target.read_text(encoding='utf-8')}
+    module.results = {'applied': [], 'skipped': [], 'failed': []}
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert module._patch_rspack_i18n(contents)
+        first = target.read_bytes()
+        assert module._patch_rspack_i18n(contents)
+    assert target.read_bytes() == first
+    assert len(module.results['applied']) == 1
+    assert len(module.results['skipped']) == 1
+    assert not module.results['failed']
+"""
+            result = subprocess.run(
+                [sys.executable, "-c", code, str(Path(__file__).resolve()),
+                 str(target)],
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(
+                payload + 'let $flag=!0||client?.get("enable_i18n",!1);',
+                target.read_text(encoding="utf-8"),
+            )
+
+    def test_rspack_desktop_gate_scan_caches_nested_generated_blocks(self):
+        code = """
+import contextlib, io, runpy, sys, tempfile
+from pathlib import Path
+helpers = runpy.run_path(sys.argv[1])
+with helpers['loaded_patch_module']() as module, tempfile.TemporaryDirectory() as tmp:
+    fixture = helpers['write_261029_rspack_assets'](Path(tmp))
+    target = fixture['main']
+    nested = ''.join('function nested%d(){' % i for i in range(128))
+    nested += 'const payload="' + 'A' * (256 * 1024) + '";'
+    nested += 'const braces="}\\\\\\\"{";/* } */' + '}' * 128
+    source = nested + target.read_text(encoding='utf-8')
+    target.write_text(source, encoding='utf-8')
+    contents = {str(target): source}
+    module.results = {'applied': [], 'skipped': [], 'failed': []}
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert module._patch_rspack_desktop_gates(contents)
+        first = target.read_bytes()
+        assert module._patch_rspack_desktop_gates(contents)
+    assert target.read_bytes() == first
+    assert len(module.results['applied']) == 3
+    assert len(module.results['skipped']) == 3
+    assert not module.results['failed']
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", code, str(Path(__file__).resolve())],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_26930_windows_taskbar_identity_uses_bootstrap_not_worker(self):
         with loaded_patch_module() as patch_module, tempfile.TemporaryDirectory() as tmp:
             main_build = Path(tmp)
@@ -1772,6 +1902,33 @@ class ChatGPTCodexPatchTests(unittest.TestCase):
                 ))
             self.assertEqual(expected_image, store_copy.read_bytes())
             self.assertFalse(Path(str(store_copy) + ".imagegen.bak").exists())
+
+    def test_261111_imagegen_branch_preserves_success_target_and_animation_flag(self):
+        with loaded_patch_module() as patch_module:
+            patches = next(
+                patches for version, patches
+                in patch_module._IMAGE_GENERATION_BINARY_PATCH_SETS
+                if "0.169.0-alpha.11.1" in version
+            )
+            _, original, patched = patches[0]
+            self.assertEqual(len(original), len(patched))
+            # The boolean store changes width but occupies the same seven
+            # bytes; the neighboring GIF flag and following load are intact.
+            self.assertEqual(original[7:], patched[7:])
+            self.assertEqual(b"\xc6\x86", patched[:2])
+            self.assertEqual(original[3:7], patched[2:6])
+            self.assertEqual(1, patched[6])
+
+            _, original, patched = patches[1]
+            self.assertEqual(len(original), len(patched))
+            self.assertEqual(b"\x0f\x85", original[2:4])
+            self.assertEqual(0xE9, patched[2])
+            original_target = 8 + struct.unpack_from("<i", original, 4)[0]
+            patched_target = 7 + struct.unpack_from("<i", patched, 3)[0]
+            self.assertEqual(original_target, patched_target)
+            self.assertLess(patched_target, 0)
+            self.assertEqual(0x90, patched[7])
+            self.assertEqual(original[8:], patched[8:])
 
     def test_windows_asar_integrity_hash_updates_only_the_copy(self):
         with loaded_patch_module() as patch_module, tempfile.TemporaryDirectory() as tmp:

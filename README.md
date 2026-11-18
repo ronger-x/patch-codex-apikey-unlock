@@ -1,6 +1,6 @@
 # ChatGPT Codex - Full Feature Unlock for API Key Mode
 
-This project targets the Codex desktop app whose display name has been changed to **ChatGPT**. It unlocks the model list, reasoning effort levels, service tiers, built-in image generation, and other features in API key mode.
+This project targets the Codex desktop app whose display name has been changed to **ChatGPT**. The latest locally verified Store package is `26.1111.2228.0` (Codex CLI `0.169.0-alpha.11.1`). It unlocks the model list, reasoning effort levels, service tiers, built-in image generation, and other features in API key mode.
 
 It has been verified with Windows Store versions `26.707.3748.0`, `26.930.4958.0`, `26.1007.9446.0`, `26.1021.3705.0`, `26.1023.6621.0`, and `26.1029.7803.0`, and the macOS app versions `26.707.31428` and `26.1013.31256` (Apple Silicon). The current adapter also targets Store packages `26.1103.3517.0` and `26.1103.7773.0`, which bundle Codex CLI `0.167.0-alpha.3.2`; their JavaScript, native-signature, full-workflow, and startup-smoke checks pass. In these versions, the display name and primary entry point have changed to ChatGPT, while installation packages may still use the Codex name. The script supports both the old and new names.
 
@@ -20,7 +20,7 @@ It has been verified with Windows Store versions `26.707.3748.0`, `26.930.4958.0
 | Usage/billing settings | Expands availability to `chatgpt \|\| apikey` |
 | i18n languages | Bypasses the Statsig experiment gate and forces the feature on |
 | Location privacy default | Defaults guest sessions and missing precise-location preferences to off in Data controls; preserves explicit account preferences and the existing permission flow |
-| Built-in image generation | On Windows `26.1021`, `26.1023`, `26.1029`, `26.1103`, and `26.1106`, exposes `image_gen.imagegen` to eligible API-key/custom-provider sessions while retaining feature, plan, provider-capability, and model-modality checks; `26.1103` and `26.1106` reuse the `26.1029` native signature set |
+| Built-in image generation | On Windows `26.1021`, `26.1023`, `26.1029`, `26.1103`, `26.1106`, and `26.1111`, exposes `image_gen.imagegen` to eligible API-key/custom-provider sessions while retaining feature, plan, provider-capability, and model-modality checks; `26.1103` and `26.1106` reuse the `26.1029` native signature set |
 
 ## Prerequisites
 
@@ -120,7 +120,7 @@ gives the patched desktop shortcut a separate `--user-data-dir`, so an already
 running official instance cannot claim the patched copy's single-instance lock.
 Because the copied executable is modified, Windows may report its vendor
 signature as invalid; the official Store installation keeps its original
-signature and remains untouched. The Windows 26.1021/26.1023/26.1029/26.1103/26.1106 image-generation patch
+signature and remains untouched. The Windows 26.1021/26.1023/26.1029/26.1103/26.1106/26.1111 image-generation patch
 also modifies the copied `resources/codex.exe`, invalidating that copy's
 vendor signature.
 
@@ -147,9 +147,15 @@ Windows app `26.1021.31345` bundles Codex CLI `0.164.0-alpha.11.1`, app `26.1023
 
 The patch does not invent image support. It retains the `[features] image_generation = true` flag, Free-plan exclusion, provider capability, and model image-input checks. In this version, Responses-compatible custom providers default to the image-generation capability, but they must still implement compatible `/images/generations` and `/images/edits` endpoints. See the [official OpenAI image-generation guide](https://developers.openai.com/api/docs/guides/image-generation).
 
-Native signature matching is currently verified for Windows `26.1021`, `26.1023`, `26.1029`, `26.1103` (CLI `0.167.0-alpha.3.2`), and `26.1106` (CLI `0.167.0-alpha.4.1`); macOS is left unchanged. The complete `26.1103` workflow and a 12-second startup smoke test passed on 2026-11-07. A version drift, missing signature, duplicate signature, or mixed signature set fails closed before ASAR repackaging.
+Native signature matching is currently verified for Windows `26.1021`, `26.1023`, `26.1029`, `26.1103` (CLI `0.167.0-alpha.3.2`), `26.1106` (CLI `0.167.0-alpha.4.1`), and `26.1111` (CLI `0.169.0-alpha.11.1`); macOS is left unchanged. The complete `26.1103` workflow and a 12-second startup smoke test passed on 2026-11-07. A version drift, missing signature, duplicate signature, or mixed signature set fails closed before ASAR repackaging.
 
 ## Version Updates
+
+Store package `26.1111.2228.0` (app `26.1111.21308`) bundles Codex CLI `0.169.0-alpha.11.1`. This CLI requires a separate native image-generation signature set. The extension patch sets only `ImageGenerationExtensionConfig::available` and preserves the adjacent GIF flag. The tool-registration patch takes the existing authentication-success branch after the feature, plan, provider-capability, and image-input checks. Its replacement near jump preserves the original destination and executable size.
+
+The renderer now places similar authentication predicates in both cloud and voice capabilities. The dictation adapter selects the `voice` property through its workspace permission marker, preserves the cloud predicates, and rejects ambiguous or changed scopes. The i18n and desktop-gate scanners use identifier boundaries, and desktop-gate validation caches nested block positions to avoid repeatedly parsing large generated modules.
+
+Validation on 2026-11-18 passed 56 tests, including 27 voice/auth/permission cases and timeout checks for large embedded payloads and nested functions. The rebuilt copy passed syntax and packed-content checks for all 23 changed JavaScript files, six native-module hash checks, exact native binary-difference checks, and the embedded ASAR hash check. Its original archive backup matched the official package. A final assets dry run reported 0 applied, 39 skipped, and 0 failed checks; the native gates were already patched. A 12-second startup check kept six desktop processes alive. Both the official and patched startup logs reported `CRX_HEADER_INVALID`; this warning also occurs with an unmodified official archive. No billable model request was sent.
 
 Store package `26.1106.6628.0` (app `26.1106.51428`) bundles Codex CLI `0.167.0-alpha.4.1`. Its renderer emits seven Fast UI modules, eight service-tier request modules, and seven usage-settings modules. The existing Rspack adapters cover every emitted copy, and both native image-generation signatures remain identical to the shared `26.1029`/`26.1103` set.
 

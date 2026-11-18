@@ -1391,9 +1391,12 @@ def apply_model_filter_patch(fp):
     print("    [OK]   Hidden model list unlock (regex)")
 
 
-def _js_block_end(content, opening_brace):
+def _js_block_end(content, opening_brace, cache=None):
     """Return the offset after a JS block, ignoring quoted strings and comments."""
+    if cache is not None and opening_brace in cache:
+        return cache[opening_brace]
     depth = 0
+    openings = []
     quote = None
     escaped = False
     line_comment = False
@@ -1426,11 +1429,17 @@ def _js_block_end(content, opening_brace):
             quote = char
         elif char == "{":
             depth += 1
+            if cache is not None:
+                openings.append(i)
         elif char == "}":
             depth -= 1
+            if cache is not None and openings:
+                cache[openings.pop()] = i + 1
             if depth == 0:
                 return i + 1
         i += 1
+    if cache is not None:
+        cache[opening_brace] = None
     return None
 
 
@@ -2538,12 +2547,15 @@ def _patch_rspack_models_and_reasoning(contents):
 def _patch_rspack_i18n(contents):
     name = "Force-enable i18n"
     identifier = r'[a-zA-Z_$][a-zA-Z0-9_$]*'
+    # Generated strings can contain megabytes of identifier characters.
+    # Start only at a token boundary instead of retrying at every suffix.
+    boundary = r'(?<![a-zA-Z0-9_$])'
     original = re.compile(
-        rf'(?P<flag>{identifier})=(?P<client>{identifier})'
+        rf'{boundary}(?P<flag>{identifier})=(?P<client>{identifier})'
         rf'\?\.get\("enable_i18n",!1\)'
     )
     patched = re.compile(
-        rf'(?P<flag>{identifier})=!0\|\|(?P<client>{identifier})'
+        rf'{boundary}(?P<flag>{identifier})=!0\|\|(?P<client>{identifier})'
         rf'\?\.get\("enable_i18n",!1\)'
     )
     candidates = []
@@ -2580,6 +2592,7 @@ def _patch_rspack_i18n(contents):
 
 def _patch_rspack_desktop_gates(contents):
     identifier = r'[a-zA-Z_$][a-zA-Z0-9_$]*'
+    boundary = r'(?<![a-zA-Z0-9_$])'
     gates = (
         ("computer_use", "isComputerUseGateEnabled", "Computer Use availability"),
         ("browser_use_external", "isExternalBrowserUseGateEnabled",
@@ -2588,6 +2601,9 @@ def _patch_rspack_desktop_gates(contents):
          "Built-in Browser availability"),
     )
     validated = []
+    # The same module can contain all three gates and thousands of nested
+    # functions. Reuse brace positions while validating this unchanged group.
+    block_caches = {}
     for feature_name, availability_field, patch_name in gates:
         feature_marker = f'featureName:"{feature_name}"'
         feature_candidates = []
@@ -2595,22 +2611,25 @@ def _patch_rspack_desktop_gates(contents):
             if feature_marker not in content:
                 continue
             for signature in re.finditer(
-                    rf'(?:function(?:[ \t]+{identifier})?|'
+                    rf'{boundary}(?:function(?:[ \t]+{identifier})?|'
                     rf'{identifier}[ \t]*:[ \t]*function)\([^)]*\)\{{',
                     content):
-                end = _js_block_end(content, signature.end() - 1)
+                end = _js_block_end(
+                    content, signature.end() - 1,
+                    cache=block_caches.setdefault(fp, {}),
+                )
                 if end is None:
                     continue
                 body = content[signature.end():end]
                 if feature_marker not in body:
                     continue
                 statsig = list(re.finditer(
-                    rf'(?P<gate>{identifier})=\(0,'
+                    rf'{boundary}(?P<gate>{identifier})=\(0,'
                     rf'{identifier}\.{identifier}\)\("[0-9]+"\)',
                     body,
                 ))
                 auth = list(re.finditer(
-                    rf'(?P<method>{identifier})=(?P<state>{identifier})'
+                    rf'{boundary}(?P<method>{identifier})=(?P<state>{identifier})'
                     rf'\?\.authMethod\?\?null;',
                     body,
                 ))
@@ -2673,8 +2692,34 @@ def _patch_rspack_dictation(contents):
     for fp, content in contents.items():
         if 'reason:"unsupported-auth"' not in content:
             continue
-        original_matches = list(original.finditer(content))
-        patched_matches = list(patched.finditer(content))
+        # 26.1111 adds a cloud gate with the same auth/status predicate.
+        # Select the voice property by its workspace permission; never expand
+        # the neighboring cloud, work-cloud, or work-local capabilities.
+        voice_marker = '"chatgpt.workspace.feature.voice.access"'
+        if (voice_marker in content or
+                ("voice:(" in content and "workCloud:" in content)):
+            scopes = [
+                scope for scope in re.finditer(
+                    r'\bvoice:\((?P<body>[^;]*?)\),workCloud:', content
+                )
+                if voice_marker in scope.group("body")
+            ]
+            if len(scopes) != 1:
+                mark_missing(
+                    f"{os.path.basename(fp)}: {name}",
+                    "Voice capability scope mismatch",
+                )
+                return False
+            scope = scopes[0]
+            original_matches = list(original.finditer(
+                content, scope.start("body"), scope.end("body")
+            ))
+            patched_matches = list(patched.finditer(
+                content, scope.start("body"), scope.end("body")
+            ))
+        else:
+            original_matches = list(original.finditer(content))
+            patched_matches = list(patched.finditer(content))
         if original_matches or patched_matches:
             candidates.append((fp, original_matches, patched_matches))
     if len(candidates) != 1:
@@ -3271,6 +3316,38 @@ def step_patch_js(assets):
 
 
 _IMAGE_GENERATION_BINARY_PATCH_SETS = (
+    (
+        "desktop 26.1111 / codex-cli 0.169.0-alpha.11.1",
+        (
+            (
+                "Image generation extension provider gate",
+                # ImageGenerationExtensionConfig::from_config: force only
+                # `available`; the adjacent animation flag stays unchanged.
+                bytes.fromhex(
+                    "44 88 a6 d0 03 00 00 44 88 ae d1 03 00 00 "
+                    "0f 10 85 40 03 00 00"
+                ),
+                bytes.fromhex(
+                    "c6 86 d0 03 00 00 01 44 88 ae d1 03 00 00 "
+                    "0f 10 85 40 03 00 00"
+                ),
+            ),
+            (
+                "Image generation tool authentication gate",
+                # image_generation_available: take the existing success edge
+                # after feature/plan/provider-capability/modality checks.
+                # The near JNE becomes JMP (+1 displacement) followed by NOP.
+                bytes.fromhex(
+                    "84 c0 0f 85 1d fc ff ff 80 bb 78 03 00 00 01 "
+                    "0f 85 a7 fa ff ff"
+                ),
+                bytes.fromhex(
+                    "84 c0 e9 1e fc ff ff 90 80 bb 78 03 00 00 01 "
+                    "0f 85 a7 fa ff ff"
+                ),
+            ),
+        ),
+    ),
     (
         "desktop 26.1021 / codex-cli 0.164.0-alpha.11.1",
         (
